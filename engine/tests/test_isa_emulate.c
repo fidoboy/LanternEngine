@@ -329,7 +329,7 @@ static void check_vector_stub_execution(void) {
         }
         memset(region, 0x90, allocation_size);
         const uint8_t instruction[5] = {
-            0xc4, 0xe2, (uint8_t)(width == 16 ? 0x79 : 0x7d), 0x20, 0xc1
+            0xc4, 0x42, (uint8_t)(width == 16 ? 0x79 : 0x7d), 0x20, 0xca
         }; /* VPMOVSXBW xmm0/ymm0, xmm1 */
         memcpy(region, instruction, sizeof instruction);
         region[5] = 0xc3; /* ret */
@@ -339,8 +339,8 @@ static void check_vector_stub_execution(void) {
         site.kind = ISA_VPMOVSXBW;
         site.width = (uint8_t)width;
         site.mode = ISA_MODE_JMP;
-        site.dst = 0;
-        site.src1 = 1;
+        site.dst = 9;
+        site.src1 = 10;
         site.src2 = ISA_NO_REG;
         site.mem_slot = ISA_MEM_NONE;
         site.base = site.index = ISA_NO_REG;
@@ -362,11 +362,11 @@ static void check_vector_stub_execution(void) {
             exit(1);
         }
 
-        __asm__ volatile("vmovdqu %0, %%ymm1" : : "m"(*(const uint8_t (*)[32])source) : "memory");
-        __asm__ volatile("vmovdqu %0, %%ymm0" : : "m"(*(const uint8_t (*)[32])destination_seed) : "memory");
+        __asm__ volatile("vmovdqu %0, %%ymm10" : : "m"(*(const uint8_t (*)[32])source) : "memory");
+        __asm__ volatile("vmovdqu %0, %%ymm9" : : "m"(*(const uint8_t (*)[32])destination_seed) : "memory");
         ((void (*)(void))region)();
-        __asm__ volatile("vmovdqu %%ymm0, %0" : "=m"(*(uint8_t (*)[32])result) : : "memory");
-        __asm__ volatile("vmovdqu %%ymm1, %0" : "=m"(*(uint8_t (*)[32])source_after) : : "memory");
+        __asm__ volatile("vmovdqu %%ymm9, %0" : "=m"(*(uint8_t (*)[32])result) : : "memory");
+        __asm__ volatile("vmovdqu %%ymm10, %0" : "=m"(*(uint8_t (*)[32])source_after) : : "memory");
 
         unsigned elements = width / 2;
         for (unsigned i = 0; i < elements; ++i) {
