@@ -316,7 +316,7 @@ IsaReport isa_rewrite_apply(IsaTable *t, unsigned char *image, unsigned char *st
         }
         if (size > ISA_STUB_BYTES) {
             fprintf(stderr, "ISA: stub for site 0x%llx exceeds %u bytes, site skipped\n",
-                    (unsigned long long)s->offset, ISA_STUB_BYTES);
+                    (unsigned long long)s->offset, (unsigned)ISA_STUB_BYTES);
             report.skipped++;
             report.unsupported_needed++;
             continue;
