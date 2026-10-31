@@ -10,7 +10,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use iced_x86::{Code, Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind, Register};
+use iced_x86::{Code, CpuidFeature, Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind, Register};
 use sha2::{Digest, Sha256};
 
 const MAGIC: &[u8; 8] = b"G3ISA1\0\0";
@@ -30,6 +30,19 @@ enum Kind {
     Blsi,
     Blsmsk,
     Blsr,
+    Vpmovsxbw,
+    Vpmovsxbd,
+    Vpmovsxbq,
+    Vpmovsxwd,
+    Vpmovsxwq,
+    Vpmovsxdq,
+    Vpmovzxbw,
+    Vpmovzxbd,
+    Vpmovzxbq,
+    Vpmovzxwd,
+    Vpmovzxwq,
+    Vpmovzxdq,
+    Avx2Unsupported,
 }
 
 impl Kind {
@@ -44,6 +57,19 @@ impl Kind {
             Self::Blsi => 7,
             Self::Blsmsk => 8,
             Self::Blsr => 9,
+            Self::Vpmovsxbw => 10,
+            Self::Vpmovsxbd => 11,
+            Self::Vpmovsxbq => 12,
+            Self::Vpmovsxwd => 13,
+            Self::Vpmovsxwq => 14,
+            Self::Vpmovsxdq => 15,
+            Self::Vpmovzxbw => 16,
+            Self::Vpmovzxbd => 17,
+            Self::Vpmovzxbq => 18,
+            Self::Vpmovzxwd => 19,
+            Self::Vpmovzxwq => 20,
+            Self::Vpmovzxdq => 21,
+            Self::Avx2Unsupported => 22,
         }
     }
 
@@ -52,7 +78,22 @@ impl Kind {
             Self::MovbeLoad | Self::MovbeStore => "MOVBE",
             Self::Lzcnt => "LZCNT",
             Self::Tzcnt | Self::Andn | Self::Bextr | Self::Blsi | Self::Blsmsk | Self::Blsr => "BMI1",
+            Self::Vpmovsxbw | Self::Vpmovsxbd | Self::Vpmovsxbq | Self::Vpmovsxwd |
+            Self::Vpmovsxwq | Self::Vpmovsxdq | Self::Vpmovzxbw | Self::Vpmovzxbd |
+            Self::Vpmovzxbq | Self::Vpmovzxwd | Self::Vpmovzxwq | Self::Vpmovzxdq |
+            Self::Avx2Unsupported => "AVX2",
         }
+    }
+
+    fn is_avx2(self) -> bool {
+        self.set() == "AVX2"
+    }
+
+    fn is_vector_conversion(self) -> bool {
+        matches!(self,
+            Self::Vpmovsxbw | Self::Vpmovsxbd | Self::Vpmovsxbq | Self::Vpmovsxwd |
+            Self::Vpmovsxwq | Self::Vpmovsxdq | Self::Vpmovzxbw | Self::Vpmovzxbd |
+            Self::Vpmovzxbq | Self::Vpmovzxwd | Self::Vpmovzxwq | Self::Vpmovzxdq)
     }
 }
 
@@ -166,7 +207,7 @@ fn read_boot_linked(data: &[u8]) -> Result<(Vec<Segment>, Vec<u8>), String> {
 }
 
 fn kind_of(ins: &Instruction) -> Option<Kind> {
-    Some(match ins.mnemonic() {
+    let kind = match ins.mnemonic() {
         Mnemonic::Movbe if ins.op0_kind() == OpKind::Register => Kind::MovbeLoad,
         Mnemonic::Movbe => Kind::MovbeStore,
         Mnemonic::Lzcnt => Kind::Lzcnt,
@@ -176,12 +217,39 @@ fn kind_of(ins: &Instruction) -> Option<Kind> {
         Mnemonic::Blsi => Kind::Blsi,
         Mnemonic::Blsmsk => Kind::Blsmsk,
         Mnemonic::Blsr => Kind::Blsr,
+        Mnemonic::Vpmovsxbw => Kind::Vpmovsxbw,
+        Mnemonic::Vpmovsxbd => Kind::Vpmovsxbd,
+        Mnemonic::Vpmovsxbq => Kind::Vpmovsxbq,
+        Mnemonic::Vpmovsxwd => Kind::Vpmovsxwd,
+        Mnemonic::Vpmovsxwq => Kind::Vpmovsxwq,
+        Mnemonic::Vpmovsxdq => Kind::Vpmovsxdq,
+        Mnemonic::Vpmovzxbw => Kind::Vpmovzxbw,
+        Mnemonic::Vpmovzxbd => Kind::Vpmovzxbd,
+        Mnemonic::Vpmovzxbq => Kind::Vpmovzxbq,
+        Mnemonic::Vpmovzxwd => Kind::Vpmovzxwd,
+        Mnemonic::Vpmovzxwq => Kind::Vpmovzxwq,
+        Mnemonic::Vpmovzxdq => Kind::Vpmovzxdq,
+        _ if ins.cpuid_features().contains(&CpuidFeature::AVX2) => Kind::Avx2Unsupported,
         _ => return None,
-    })
+    };
+    Some(kind)
 }
 
 fn register_number(register: Register) -> u8 {
     if register == Register::None { NO_REG } else { register.number() as u8 }
+}
+
+fn vector_register_number(register: Register) -> u8 {
+    let first = if register.size() == 16 { Register::XMM0.number() } else { Register::YMM0.number() };
+    register.number().saturating_sub(first) as u8
+}
+
+fn site_register_number(kind: Kind, register: Register) -> u8 {
+    if kind.is_vector_conversion() && (register.size() == 16 || register.size() == 32) {
+        vector_register_number(register)
+    } else {
+        register_number(register)
+    }
 }
 
 fn site_of(ins: &Instruction, kind: Kind, bytes: &[u8]) -> Site {
@@ -193,9 +261,11 @@ fn site_of(ins: &Instruction, kind: Kind, bytes: &[u8]) -> Site {
             OpKind::Register => {
                 let register = ins.op_register(operand);
                 if let Some(slot) = registers.get_mut(operand as usize) {
-                    *slot = register_number(register);
+                    *slot = site_register_number(kind, register);
                 }
-                if width == 0 { width = register.size() * 8; }
+                if width == 0 {
+                    width = if kind.is_vector_conversion() { register.size() } else { register.size() * 8 };
+                }
             }
             OpKind::Memory => mem_slot = if operand == 0 { 1 } else { 2 },
             _ => {}
@@ -221,6 +291,10 @@ fn site_of(ins: &Instruction, kind: Kind, bytes: &[u8]) -> Site {
         relocated: Vec::new(),
     };
 
+    if kind == Kind::Avx2Unsupported {
+        site.mode = Mode::Unsupported;
+        return site;
+    }
     let mut unsupported = ins.segment_prefix() != Register::None || ins.has_lock_prefix();
     if mem_slot != 0 {
         unsupported |= [ins.memory_base(), ins.memory_index()]
@@ -360,6 +434,7 @@ fn missing_cpu_sets() -> Vec<&'static str> {
     if leaf1_ecx & (1 << 22) == 0 { missing.push("MOVBE"); }
     if leaf7_ebx & (1 << 3) == 0 { missing.push("BMI1"); }
     if extended_ecx & (1 << 5) == 0 { missing.push("LZCNT"); }
+    if leaf7_ebx & (1 << 5) == 0 { missing.push("AVX2"); }
     missing
 }
 
@@ -371,7 +446,7 @@ fn missing_cpu_sets() -> Vec<&'static str> {
 fn scan(boot: &Path, out: &Path) -> Result<String, String> {
     let missing = missing_cpu_sets();
     if missing.is_empty() {
-        return Ok("CPU: native MOVBE, BMI1 and LZCNT; scanner skipped, original code will execute natively".into());
+        return Ok("CPU: native MOVBE, BMI1, LZCNT and AVX2; scanner skipped, original code will execute natively".into());
     }
     let data = fs::read(boot).map_err(|e| format!("{}: {e}", boot.display()))?;
     let (segments, image) = read_boot_linked(&data)?;
@@ -400,9 +475,9 @@ fn scan(boot: &Path, out: &Path) -> Result<String, String> {
     let int3 = sites.iter().filter(|s| s.mode == Mode::Int3).count();
     let unsupported = sites.iter().filter(|s| s.mode == Mode::Unsupported).count();
     Ok(format!(
-        "CPU missing {}; ISA: {} sites (MOVBE {}, BMI1 {}, LZCNT {}); {} relocated, {} int3, {} unsupported",
+        "CPU missing {}; ISA: {} sites (MOVBE {}, BMI1 {}, LZCNT {}, AVX2 {}); {} relocated, {} int3, {} unsupported",
         missing.join(", "), sites.len(), count_set("MOVBE"), count_set("BMI1"), count_set("LZCNT"),
-        relocated, int3, unsupported
+        count_set("AVX2"), relocated, int3, unsupported
     ))
 }
 
@@ -477,6 +552,32 @@ mod tests {
         assert_eq!(sites[1].kind, Kind::Blsr);
         assert_eq!(sites[2].kind, Kind::Lzcnt);
         assert!(sites.iter().all(|s| s.mode != Mode::Unsupported));
+    }
+
+
+    #[test]
+    fn scans_all_avx2_sign_and_zero_extension_moves() {
+        let code = bytes(
+            "c4e27920c1c4e27921c1c4e27922c1c4e27923c1c4e27924c1c4e27925c1\
+             c4e27930c1c4e27931c1c4e27932c1c4e27933c1c4e27934c1c4e27935c1"
+                .replace(' ', "").as_str()
+        );
+        let sites = scan_segment(&code, 0x2000);
+        assert_eq!(sites.len(), 12);
+        assert_eq!(sites[0].kind, Kind::Vpmovsxbw);
+        assert_eq!(sites[1].kind, Kind::Vpmovsxbd);
+        assert_eq!(sites[2].kind, Kind::Vpmovsxbq);
+        assert_eq!(sites[3].kind, Kind::Vpmovsxwd);
+        assert_eq!(sites[4].kind, Kind::Vpmovsxwq);
+        assert_eq!(sites[5].kind, Kind::Vpmovsxdq);
+        assert_eq!(sites[6].kind, Kind::Vpmovzxbw);
+        assert_eq!(sites[7].kind, Kind::Vpmovzxbd);
+        assert_eq!(sites[8].kind, Kind::Vpmovzxbq);
+        assert_eq!(sites[9].kind, Kind::Vpmovzxwd);
+        assert_eq!(sites[10].kind, Kind::Vpmovzxwq);
+        assert_eq!(sites[11].kind, Kind::Vpmovzxdq);
+        assert!(sites.iter().all(|site| site.width == 16 && site.dst == 0 && site.src1 == 1));
+        assert!(sites.iter().all(|site| site.mode != Mode::Unsupported));
     }
 
     #[test]
