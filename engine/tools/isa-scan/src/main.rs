@@ -733,11 +733,6 @@ fn scan(boot: &Path, out: &Path) -> Result<String, String> {
         .take(16)
         .map(|entry| {
             let site = &entry.site;
-            let length = usize::from(site.length).min(site.original.len());
-            let bytes = site.original[..length].iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<Vec<_>>()
-                .join(" ");
             let provenance = if strong_roots.binary_search(&entry.root).is_ok() {
                 "strong"
             } else {
