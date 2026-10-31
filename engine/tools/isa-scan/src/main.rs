@@ -729,7 +729,7 @@ mod tests {
         let size = code.len() as u64;
         let words = [
             size, 0, 1, 1, 0, 1,       // BBPROBE5 header: one relocation
-            0, 0, 0, 0,                 // procparam and main TLS
+            0, 0, 0, 0, 0,             // procparam and main TLS
             1,                           // one module
             0, size, 0, 0, 0, 0, 0,    // module metadata
             0,                           // no native bindings
