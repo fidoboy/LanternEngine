@@ -486,6 +486,7 @@ fn scan_reachable(segments: &[Segment], image: &[u8], roots: &[u64]) -> Vec<Site
                         if executable_address(target, segments) {
                             queue.push_back(target);
                         }
+                    }
                 }
                 FlowControl::UnconditionalBranch => {
                     if let Some(target) = direct_target {
@@ -626,11 +627,11 @@ fn scan(boot: &Path, out: &Path) -> Result<String, String> {
     let int3 = sites.iter().filter(|s| s.mode == Mode::Int3).count();
     let unsupported = sites.iter().filter(|s| s.mode == Mode::Unsupported).count();
     Ok(format!(
-        "CPU missing {}; ISA: {} sites (MOVBE {}, BMI1 {}, LZCNT {}, AVX2 {}); {} relocated, {} int3, {} unsupported\\n\\
+        "CPU missing {}; ISA: {} sites (MOVBE {}, BMI1 {}, LZCNT {}, AVX2 {}); {} relocated, {} int3, {} unsupported\n\
          ISA CFG: {} roots, {} reachable AVX2 sites ({} unsupported); {} unsupported AVX2 candidates only in linear sweep",
         missing.join(", "), sites.len(), count_set("MOVBE"), count_set("BMI1"), count_set("LZCNT"),
         count_set("AVX2"), relocated, int3, unsupported, linked.roots.len(), reachable_avx2,
-        reachable_unsupported, linear_unsupported.saturating_sub(reachable_unsupported).max(linear_only_unsupported)
+        reachable_unsupported, linear_only_unsupported
     ))
 }
 
