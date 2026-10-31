@@ -90,15 +90,17 @@ static void check_cpu(void) {
     if (!(leaf1_c & bit_MOVBE)) isa_missing_sets |= CPU_SET_MOVBE;
     if (!(leaf7_b & bit_BMI)) isa_missing_sets |= CPU_SET_BMI1;
     if (!(ext1_c & bit_LZCNT)) isa_missing_sets |= CPU_SET_LZCNT;
+    if (!(leaf7_b & (1u << 5))) isa_missing_sets |= CPU_SET_AVX2;
 
     if (isa_missing_sets) {
         char absent[32] = "";
         if (isa_missing_sets & CPU_SET_MOVBE) strcat(absent, "MOVBE");
         if (isa_missing_sets & CPU_SET_BMI1) strcat(absent, absent[0] ? ", BMI1" : "BMI1");
         if (isa_missing_sets & CPU_SET_LZCNT) strcat(absent, absent[0] ? ", LZCNT" : "LZCNT");
+        if (isa_missing_sets & CPU_SET_AVX2) strcat(absent, absent[0] ? ", AVX2" : "AVX2");
         printf("CPU: missing %s; enabling instruction compatibility rewriting\n", absent);
     } else {
-        puts("CPU: native MOVBE, BMI1 and LZCNT; instruction rewriting disabled");
+        puts("CPU: native MOVBE, BMI1, LZCNT and AVX2; instruction rewriting disabled");
     }
 }
 static uint64_t read64(FILE *f) {
@@ -1086,7 +1088,7 @@ int main(int argc, char **argv) {
         if (isa_stubs_size) isa_stubs = allocate(isa_stubs_size);
         IsaReport report = isa_rewrite_apply(isa_table, image, isa_stubs, isa_missing_sets);
         if (report.unsupported_needed)
-            fail("the linked image contains MOVBE/BMI1/LZCNT encodings that this compatibility layer cannot rewrite");
+            fail("the linked image contains MOVBE/BMI1/LZCNT/AVX2 encodings that this compatibility layer cannot rewrite");
         if (isa_stubs && isa_stubs_size) protect(isa_stubs, isa_stubs_size, 5);
         printf("ISA: rewrote %u sites (%u jmp, %u relocated, %u int3); %u changed sites skipped\n",
                report.rewritten, report.jmp, report.relocated, report.int3, report.skipped);
