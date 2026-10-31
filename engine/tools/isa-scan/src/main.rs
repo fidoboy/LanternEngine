@@ -580,6 +580,14 @@ mod tests {
         assert_eq!(sites[11].kind, Kind::Vpmovzxdq);
         assert!(sites.iter().all(|site| site.width == 16 && site.dst == 0 && site.src1 == 1));
         assert!(sites.iter().all(|site| site.mode != Mode::Unsupported));
+
+        // VPMOVSXBW ymm0, xmm1 exercises 256-bit destination and 128-bit source register mapping.
+        let ymm_site = scan_segment(&bytes("c4e27d20c1"), 0x2100).remove(0);
+        assert_eq!(ymm_site.kind, Kind::Vpmovsxbw);
+        assert_eq!(ymm_site.width, 32);
+        assert_eq!(ymm_site.dst, 0);
+        assert_eq!(ymm_site.src1, 1);
+        assert_ne!(ymm_site.mode, Mode::Unsupported);
     }
 
 
