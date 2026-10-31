@@ -9,8 +9,12 @@
 #include "isa_emulate.h"
 #include "isa_rewrite.h"
 #include <cpuid.h>
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <sys/mman.h>
 #include <unistd.h>
+#endif
 
 static int host_has_required_isa(void) {
     unsigned a = 0, b = 0, c = 0, d = 0, leaf1 = 0, leaf7 = 0, ext1 = 0;
@@ -297,22 +301,50 @@ static int host_has_avx_state(void) {
     return (lo & 6) == 6;
 }
 
+static unsigned char *allocate_test_pages(size_t *page_size, size_t *allocation_size) {
+#ifdef _WIN32
+    SYSTEM_INFO info;
+    GetSystemInfo(&info);
+    *page_size = info.dwPageSize;
+    *allocation_size = *page_size * 2;
+    return (unsigned char *)VirtualAlloc(NULL, *allocation_size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    long page = sysconf(_SC_PAGESIZE);
+    if (page <= 0) return NULL;
+    *page_size = (size_t)page;
+    *allocation_size = *page_size * 2;
+    void *region = mmap(NULL, *allocation_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    return region == MAP_FAILED ? NULL : region;
+#endif
+}
+
+static int protect_test_pages(unsigned char *region, size_t size, int writable) {
+#ifdef _WIN32
+    DWORD previous;
+    return VirtualProtect(region, size, writable ? PAGE_READWRITE : PAGE_EXECUTE_READ, &previous) != 0;
+#else
+    return mprotect(region, size, writable ? PROT_READ | PROT_WRITE : PROT_READ | PROT_EXEC) == 0;
+#endif
+}
+
+static void release_test_pages(unsigned char *region, size_t allocation_size) {
+#ifdef _WIN32
+    VirtualFree(region, 0, MEM_RELEASE);
+#else
+    munmap(region, allocation_size);
+#endif
+}
+
 /* Execute the generated AVX1 save/restore stub around a rewritten AVX2 instruction. */
 static void check_vector_stub_execution(void) {
     if (!host_has_avx_state()) {
         puts("isa-emulate-test: vector stub execution skipped (OS AVX state unavailable)");
         return;
     }
-    long page_size = sysconf(_SC_PAGESIZE);
-    if (page_size <= 0) {
-        puts("isa-emulate-test FAILED: cannot determine page size");
-        exit(1);
-    }
-    size_t allocation_size = (size_t)page_size * 2;
-    unsigned char *region = mmap(NULL, allocation_size, PROT_READ | PROT_WRITE,
-                                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (region == MAP_FAILED) {
-        puts("isa-emulate-test FAILED: mmap for vector stub");
+    size_t page_size = 0, allocation_size = 0;
+    unsigned char *region = allocate_test_pages(&page_size, &allocation_size);
+    if (!region) {
+        puts("isa-emulate-test FAILED: cannot allocate memory for vector stub");
         exit(1);
     }
 
@@ -323,7 +355,7 @@ static void check_vector_stub_execution(void) {
     }
 
     for (unsigned width = 16; width <= 32; width += 16) {
-        if (mprotect(region, allocation_size, PROT_READ | PROT_WRITE) != 0) {
+        if (!protect_test_pages(region, allocation_size, 1)) {
             puts("isa-emulate-test FAILED: mprotect writable");
             exit(1);
         }
@@ -357,7 +389,7 @@ static void check_vector_stub_execution(void) {
             puts("isa-emulate-test FAILED: AVX2 site was not rewritten");
             exit(1);
         }
-        if (mprotect(region, allocation_size, PROT_READ | PROT_EXEC) != 0) {
+        if (!protect_test_pages(region, allocation_size, 0)) {
             puts("isa-emulate-test FAILED: mprotect executable");
             exit(1);
         }
@@ -384,7 +416,7 @@ static void check_vector_stub_execution(void) {
         if (memcmp(source, source_after, sizeof source) != 0)
             fail(ISA_VPMOVSXBW, width, 0, 0, "generated stub source YMM preservation", source[0], source_after[0]);
     }
-    munmap(region, allocation_size);
+    release_test_pages(region, allocation_size);
 }
 
 static void vector_shape(uint8_t kind, unsigned *source_bytes, unsigned *destination_bytes, int *is_signed) {
