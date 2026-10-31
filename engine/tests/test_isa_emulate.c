@@ -518,7 +518,7 @@ int main(void) {
     check_vector_stub_execution();
     check_vector_extensions();
     if (!host_has_required_isa()) {
-        puts("isa-emulate-test skipped: CPU lacks BMI1, LZCNT or MOVBE");
+        puts("isa-emulate-test: native scalar differential tests skipped (CPU lacks BMI1, LZCNT or MOVBE)");
         return 0;
     }
     if (isa_defined_flags(ISA_MOVBE_LOAD) != 0 || isa_defined_flags(ISA_LZCNT) != (ISA_CF | ISA_ZF)
