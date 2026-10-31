@@ -782,6 +782,9 @@ mod tests {
         let boot = lantern_boot_linked(&code);
         let linked = read_boot_linked(&boot).unwrap();
         assert_eq!(linked.segments.len(), 1);
+        assert_eq!(linked.modules.len(), 1);
+        assert_eq!(linked.modules[0].base, 0);
+        assert_eq!(linked.modules[0].size, code.len() as u64);
         assert_eq!(linked.segments[0].address, 0);
         assert_eq!(linked.segments[0].size, code.len() as u64);
         assert_eq!(linked.segments[0].flags & 1, 1);
