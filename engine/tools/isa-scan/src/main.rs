@@ -217,7 +217,6 @@ fn read_boot_linked(data: &[u8]) -> Result<LinkedImage, String> {
     if binding_count > import_count {
         return Err("invalid native binding count".into());
     }
-    let mut binding_roots = Vec::new();
     for _ in 0..binding_count {
         let _import_index = take_u64(data, &mut at)?;
         let address = take_u64(data, &mut at)?;
