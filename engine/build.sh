@@ -197,6 +197,9 @@ if [[ -n $windows ]]; then
 fi
 
 if [[ ${1:-} == --test ]]; then
+    "$CC" "${cstd[@]}" -O2 -g -Wall -Wextra -Werror -mgeneral-regs-only "${includes[@]}" -I. -Isrc \
+        tests/test_isa_emulate.c src/isa_emulate.c src/isa_rewrite.c -o out/isa-emulate-test
+    out/isa-emulate-test
     test_link=()
     if [[ -n $windows ]]; then test_link=(-lws2_32 -lwinpthread -Wl,--disable-dynamicbase,--disable-high-entropy-va); fi
     "$CC" "${cstd[@]}" -O2 -g -Wall -Wextra -Werror "${threads[@]}" "${includes[@]}" -I. -Isrc tests/test_pad.c "${sys_tests[@]}" out/libatrac9.a -lm "${libraries[@]}" "${test_link[@]}" -o out/pad-test
