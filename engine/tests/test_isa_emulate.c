@@ -362,11 +362,11 @@ static void check_vector_stub_execution(void) {
             exit(1);
         }
 
-        __asm__ volatile("vmovdqu %0, %%ymm1" : : "m"(*(const uint8_t (*)[32])source) : "ymm1", "memory");
-        __asm__ volatile("vmovdqu %0, %%ymm0" : : "m"(*(const uint8_t (*)[32])destination_seed) : "ymm0", "memory");
+        __asm__ volatile("vmovdqu %0, %%ymm1" : : "m"(*(const uint8_t (*)[32])source) : "memory");
+        __asm__ volatile("vmovdqu %0, %%ymm0" : : "m"(*(const uint8_t (*)[32])destination_seed) : "memory");
         ((void (*)(void))region)();
-        __asm__ volatile("vmovdqu %%ymm0, %0" : "=m"(*(uint8_t (*)[32])result) : : "ymm0", "memory");
-        __asm__ volatile("vmovdqu %%ymm1, %0" : "=m"(*(uint8_t (*)[32])source_after) : : "ymm1", "memory");
+        __asm__ volatile("vmovdqu %%ymm0, %0" : "=m"(*(uint8_t (*)[32])result) : : "memory");
+        __asm__ volatile("vmovdqu %%ymm1, %0" : "=m"(*(uint8_t (*)[32])source_after) : : "memory");
 
         unsigned elements = width / 2;
         for (unsigned i = 0; i < elements; ++i) {
