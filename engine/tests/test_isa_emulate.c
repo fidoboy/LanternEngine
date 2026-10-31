@@ -348,8 +348,8 @@ static void check_vector_extensions(void) {
                             expected[element * destination_size + b] = (uint8_t)(value >> (8 * b));
                     }
 
-                    uint8_t saved_source[32];
-                    memcpy(saved_source, regs.ymm[1], sizeof saved_source);
+                    uint8_t saved_vectors[16][32];
+                    memcpy(saved_vectors, regs.ymm, sizeof saved_vectors);
                     uint64_t saved_flags = regs.rflags;
                     uint64_t saved_gprs[16];
                     memcpy(saved_gprs, regs.gpr, sizeof saved_gprs);
@@ -364,16 +364,14 @@ static void check_vector_extensions(void) {
                             if (regs.ymm[0][b] != 0)
                                 fail(kind, width, round, memory, "upper YMM zeroing", 0, regs.ymm[0][b]);
                     }
-                    if (!memory && memcmp(regs.ymm[1], saved_source, sizeof saved_source) != 0)
-                        fail(kind, width, round, memory, "vector source preservation", 0, 1);
                     if (regs.rflags != saved_flags)
                         fail(kind, width, round, memory, "flags", saved_flags, regs.rflags);
                     for (unsigned i = 0; i < 16; ++i)
                         if (regs.gpr[i] != saved_gprs[i])
                             fail(kind, width, round, memory, "GPR preservation", saved_gprs[i], regs.gpr[i]);
                     for (unsigned i = 1; i < 16; ++i)
-                        if (memcmp(regs.ymm[i], (uint8_t[32]){0}, 32) == 0)
-                            fail(kind, width, round, memory, "unexpected vector clear", 1, 0);
+                        if (memcmp(regs.ymm[i], saved_vectors[i], 32) != 0)
+                            fail(kind, width, round, memory, "vector preservation", saved_vectors[i][0], regs.ymm[i][0]);
                 }
             }
         }
