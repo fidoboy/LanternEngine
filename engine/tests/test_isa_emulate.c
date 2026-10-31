@@ -385,7 +385,7 @@ static void check_vector_stub_execution(void) {
         table.sites = &site;
         table.hits = &hit;
         table.count = 1;
-        IsaReport report = isa_rewrite_apply(&table, region, region + page_size, CPU_SET_AVX2);
+        IsaReport report = isa_rewrite_apply(&table, region, region + page_size, CPU_SET_AVX2, 0);
         if (report.rewritten != 1 || report.unsupported_needed != 0) {
             puts("isa-emulate-test FAILED: AVX2 site was not rewritten");
             exit(1);
