@@ -273,7 +273,8 @@ static void patch_site(unsigned char *site, const IsaSite *s, int32_t rel) {
     memset(p, 0x90, covered - JMP_BYTES);
 }
 
-IsaReport isa_rewrite_apply(IsaTable *t, unsigned char *image, unsigned char *stubs, unsigned sets) {
+IsaReport isa_rewrite_apply(IsaTable *t, unsigned char *image, unsigned char *stubs, unsigned sets,
+                            int diagnostic_avx2) {
     IsaReport report = {0};
     t->image = image;
     t->stubs = stubs;
@@ -282,6 +283,10 @@ IsaReport isa_rewrite_apply(IsaTable *t, unsigned char *image, unsigned char *st
     for (uint32_t i = 0; i < t->count; i++) {
         const IsaSite *s = &t->sites[i];
         if (s->mode != ISA_MODE_UNSUPPORTED || !(isa_site_set(s) & sets)) continue;
+        if (diagnostic_avx2 && s->kind == ISA_AVX2_UNSUPPORTED) {
+            report.diagnostic_avx2++;
+            continue; /* Leave these bytes untouched; a real execution raises #UD on this host. */
+        }
         report.unsupported_needed++;
         if (unsupported_shown++ < 16) {
             fprintf(stderr, "ISA: unsupported %s at +0x%llx bytes:",
@@ -342,6 +347,50 @@ IsaReport isa_rewrite_apply(IsaTable *t, unsigned char *image, unsigned char *st
         report.rewritten++;
     }
     return report;
+}
+
+int isa_rewrite_describe_fault(const IsaTable *t, uintptr_t rip, char *buffer, size_t capacity) {
+    if (!buffer || capacity == 0) return 0;
+    buffer[0] = '\0';
+    if (!t || !t->image || rip < (uintptr_t)t->image) return 0;
+    uint64_t offset = (uint64_t)(rip - (uintptr_t)t->image);
+    if (offset >= t->image_size) return 0;
+
+    uint32_t lo = 0, hi = t->count;
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2;
+        if (t->sites[mid].offset < offset) lo = mid + 1;
+        else hi = mid;
+    }
+    const IsaSite *site = lo < t->count && t->sites[lo].offset == offset ? &t->sites[lo] : NULL;
+    const unsigned char *bytes = t->image + offset;
+    size_t length = site ? site->length : (size_t)(t->image_size - offset);
+    if (length > 15) length = 15;
+
+    int n = site
+        ? snprintf(buffer, capacity, "ISA diagnostic: #UD at guest +0x%llx; scanner candidate %s%s; bytes:",
+                   (unsigned long long)offset, isa_kind_name(site->kind),
+                   memcmp(bytes, site->original, site->length) == 0 ? "" : " (live bytes differ from scan)")
+        : snprintf(buffer, capacity, "ISA diagnostic: #UD at guest +0x%llx; address not present in the scanner table; bytes:",
+                   (unsigned long long)offset);
+    if (n < 0) return 0;
+    size_t used = (size_t)n < capacity ? (size_t)n : capacity - 1;
+    for (size_t i = 0; i < length && used < capacity - 1; ++i) {
+        n = snprintf(buffer + used, capacity - used, " %02x", bytes[i]);
+        if (n < 0) break;
+        if ((size_t)n >= capacity - used) {
+            used = capacity - 1;
+            break;
+        }
+        used += (size_t)n;
+    }
+    if (used < capacity - 1) {
+        buffer[used++] = '\n';
+        buffer[used] = '\0';
+    } else {
+        buffer[capacity - 1] = '\0';
+    }
+    return (int)used;
 }
 
 /* ---- int3 trap, stub lookup, report ---- */
