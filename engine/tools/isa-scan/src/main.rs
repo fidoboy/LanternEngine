@@ -4,6 +4,8 @@
 // Modified for Lantern Engine: read BBPROBE5, rewrite MOVBE/BMI1/LZCNT and selected AVX2
 // integer conversions, and fail closed on other AVX2 instructions when the host lacks AVX2.
 
+#![deny(unused_variables)]
+
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
