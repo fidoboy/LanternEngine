@@ -66,8 +66,11 @@ static uint64_t native_register(uint8_t kind, int width, uint64_t src1, uint64_t
 }
 
 static const char *kind_name(uint8_t kind) {
-    static const char *const names[] = {"?", "MOVBE_LOAD", "MOVBE_STORE", "LZCNT", "TZCNT", "ANDN", "BEXTR",
-                                        "BLSI", "BLSMSK", "BLSR"};
+    static const char *const names[] = {
+        "?", "MOVBE_LOAD", "MOVBE_STORE", "LZCNT", "TZCNT", "ANDN", "BEXTR", "BLSI", "BLSMSK", "BLSR",
+        "VPMOVSXBW", "VPMOVSXBD", "VPMOVSXBQ", "VPMOVSXWD", "VPMOVSXWQ", "VPMOVSXDQ",
+        "VPMOVZXBW", "VPMOVZXBD", "VPMOVZXBQ", "VPMOVZXWD", "VPMOVZXWQ", "VPMOVZXDQ"
+    };
     return kind < sizeof names / sizeof names[0] ? names[kind] : "?";
 }
 
@@ -280,7 +283,105 @@ static void check_memory_sources(void) {
     }
 }
 
+
+static void vector_shape(uint8_t kind, unsigned *source_bytes, unsigned *destination_bytes, int *is_signed) {
+    static const uint8_t source_sizes[6] = {1, 1, 1, 2, 2, 4};
+    static const uint8_t destination_sizes[6] = {2, 4, 8, 4, 8, 8};
+    unsigned index;
+    if (kind >= ISA_VPMOVSXBW && kind <= ISA_VPMOVSXDQ) {
+        index = kind - ISA_VPMOVSXBW;
+        *is_signed = 1;
+    } else {
+        index = kind - ISA_VPMOVZXBW;
+        *is_signed = 0;
+    }
+    *source_bytes = source_sizes[index];
+    *destination_bytes = destination_sizes[index];
+}
+
+static void check_vector_extensions(void) {
+    for (uint8_t kind = ISA_VPMOVSXBW; kind <= ISA_VPMOVZXDQ; ++kind) {
+        unsigned source_size, destination_size;
+        int is_signed;
+        vector_shape(kind, &source_size, &destination_size, &is_signed);
+        for (unsigned width = 16; width <= 32; width += 16) {
+            unsigned elements = width / destination_size;
+            unsigned input_size = elements * source_size;
+            for (int memory = 0; memory <= 1; ++memory) {
+                for (unsigned round = 0; round < 128; ++round) {
+                    uint8_t source[32], memory_buffer[64], expected[32] = {0};
+                    IsaRegs regs = {0};
+                    IsaSite site = {0};
+                    for (unsigned i = 0; i < sizeof source; ++i) source[i] = (uint8_t)xorshift64();
+                    memset(memory_buffer, 0xa5, sizeof memory_buffer);
+                    memcpy(memory_buffer + 5, source, input_size);
+
+                    for (unsigned i = 0; i < 16; ++i) {
+                        regs.gpr[i] = 0x0102030405060708ull * (i + 1);
+                        for (unsigned b = 0; b < 32; ++b)
+                            regs.ymm[i][b] = (uint8_t)(i * 19 + b * 7 + round);
+                    }
+                    regs.rflags = 0x8d5;
+                    if (!memory) memcpy(regs.ymm[1], source, sizeof source);
+                    regs.gpr[2] = (uint64_t)(uintptr_t)memory_buffer;
+
+                    site.kind = kind;
+                    site.width = (uint8_t)width; /* vector width is stored in bytes */
+                    site.dst = 0;
+                    site.src1 = memory ? ISA_NO_REG : 1;
+                    site.src2 = ISA_NO_REG;
+                    site.mem_slot = memory ? ISA_MEM_SRC : ISA_MEM_NONE;
+                    site.base = memory ? 2 : ISA_NO_REG;
+                    site.index = ISA_NO_REG;
+                    site.scale = 1;
+                    site.disp = 5;
+
+                    for (unsigned element = 0; element < elements; ++element) {
+                        uint64_t value = 0;
+                        for (unsigned b = 0; b < source_size; ++b)
+                            value |= (uint64_t)source[element * source_size + b] << (8 * b);
+                        if (is_signed && (value & (1ull << (source_size * 8 - 1)))) {
+                            uint64_t mask = (1ull << (source_size * 8)) - 1;
+                            value |= ~mask;
+                        }
+                        for (unsigned b = 0; b < destination_size; ++b)
+                            expected[element * destination_size + b] = (uint8_t)(value >> (8 * b));
+                    }
+
+                    uint8_t saved_source[32];
+                    memcpy(saved_source, regs.ymm[1], sizeof saved_source);
+                    uint64_t saved_flags = regs.rflags;
+                    uint64_t saved_gprs[16];
+                    memcpy(saved_gprs, regs.gpr, sizeof saved_gprs);
+                    isa_emulate(&site, &regs);
+
+                    for (unsigned b = 0; b < width; ++b) {
+                        if (regs.ymm[0][b] != expected[b])
+                            fail(kind, width, round, memory, "vector result", expected[b], regs.ymm[0][b]);
+                    }
+                    if (width == 16) {
+                        for (unsigned b = 16; b < 32; ++b)
+                            if (regs.ymm[0][b] != 0)
+                                fail(kind, width, round, memory, "upper YMM zeroing", 0, regs.ymm[0][b]);
+                    }
+                    if (!memory && memcmp(regs.ymm[1], saved_source, sizeof saved_source) != 0)
+                        fail(kind, width, round, memory, "vector source preservation", 0, 1);
+                    if (regs.rflags != saved_flags)
+                        fail(kind, width, round, memory, "flags", saved_flags, regs.rflags);
+                    for (unsigned i = 0; i < 16; ++i)
+                        if (regs.gpr[i] != saved_gprs[i])
+                            fail(kind, width, round, memory, "GPR preservation", saved_gprs[i], regs.gpr[i]);
+                    for (unsigned i = 1; i < 16; ++i)
+                        if (memcmp(regs.ymm[i], (uint8_t[32]){0}, 32) == 0)
+                            fail(kind, width, round, memory, "unexpected vector clear", 1, 0);
+                }
+            }
+        }
+    }
+}
+
 int main(void) {
+    check_vector_extensions();
     if (!host_has_required_isa()) {
         puts("isa-emulate-test skipped: CPU lacks BMI1, LZCNT or MOVBE");
         return 0;
