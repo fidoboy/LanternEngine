@@ -146,14 +146,26 @@ fn checked_skip(data: &[u8], at: &mut usize, count: u64, width: u64) -> Result<(
     Ok(())
 }
 
-// Lantern's BBPROBE5 and SpartanPort's G3PROBE5 have the same linked-image
-// field layout. Besides executable segments, retain roots that can seed a conservative
-// control-flow walk: the main entry, module initializers, imported function bindings and
-// image-relative relocations whose values point into executable memory.
+// Keep provenance for CFG roots. Entry points, module initializers and linked STT_FUNC
+// bindings are strong roots. Image-relative relocations into executable memory are only
+// candidate function pointers: they can also describe addresses of internal code/data labels.
+#[derive(Default)]
+struct ScanRoots {
+    entry_and_init: Vec<u64>,
+    function_bindings: Vec<u64>,
+    relocation_candidates: Vec<u64>,
+}
+
 struct LinkedImage {
     segments: Vec<Segment>,
     image: Vec<u8>,
-    roots: Vec<u64>,
+    roots: ScanRoots,
+}
+
+fn normalize_roots(roots: &mut Vec<u64>, segments: &[Segment]) {
+    roots.retain(|address| executable_address(*address, segments));
+    roots.sort_unstable();
+    roots.dedup();
 }
 
 fn executable_address(address: u64, segments: &[Segment]) -> bool {
@@ -187,7 +199,7 @@ fn read_boot_linked(data: &[u8]) -> Result<LinkedImage, String> {
         return Err("invalid linked module count".into());
     }
 
-    let mut roots = vec![entry];
+    let mut roots = ScanRoots { entry_and_init: vec![entry], ..ScanRoots::default() };
     for _ in 0..module_count {
         let _base = take_u64(data, &mut at)?;
         let _size = take_u64(data, &mut at)?;
@@ -197,7 +209,7 @@ fn read_boot_linked(data: &[u8]) -> Result<LinkedImage, String> {
         let _tls_filesz = take_u64(data, &mut at)?;
         let _tls_module = take_u64(data, &mut at)?;
         if init != 0 {
-            roots.push(init);
+            roots.entry_and_init.push(init);
         }
     }
 
@@ -212,7 +224,7 @@ fn read_boot_linked(data: &[u8]) -> Result<LinkedImage, String> {
         let kind = take_u64(data, &mut at)?;
         // link_modules.py writes kind 1 for STT_FUNC exports and kind 2 for objects.
         if kind == 1 {
-            binding_roots.push(address);
+            roots.function_bindings.push(address);
         }
     }
 
@@ -229,7 +241,6 @@ fn read_boot_linked(data: &[u8]) -> Result<LinkedImage, String> {
 
     checked_skip(data, &mut at, import_count, 128)?;
 
-    let mut relocation_roots = Vec::new();
     for _ in 0..reloc_count {
         let _target = take_u64(data, &mut at)?;
         let kind = take_u64(data, &mut at)?;
@@ -238,7 +249,7 @@ fn read_boot_linked(data: &[u8]) -> Result<LinkedImage, String> {
         // kind 0 is an image-relative relocation. It may be a static function pointer;
         // kinds 1 and 2 are imports/TLS and do not contain a local image code address.
         if kind == 0 {
-            relocation_roots.push(value);
+            roots.relocation_candidates.push(value);
         }
     }
 
@@ -248,11 +259,9 @@ fn read_boot_linked(data: &[u8]) -> Result<LinkedImage, String> {
         return Err("linked image is truncated or has trailing data".into());
     }
 
-    roots.extend(binding_roots);
-    roots.extend(relocation_roots);
-    roots.retain(|address| executable_address(*address, &segments));
-    roots.sort_unstable();
-    roots.dedup();
+    normalize_roots(&mut roots.entry_and_init, &segments);
+    normalize_roots(&mut roots.function_bindings, &segments);
+    normalize_roots(&mut roots.relocation_candidates, &segments);
 
     Ok(LinkedImage { segments, image: data[at..end].to_vec(), roots })
 }
@@ -598,19 +607,30 @@ fn scan(boot: &Path, out: &Path) -> Result<String, String> {
         sites.extend(scan_segment(code, segment.address));
     }
 
-    // A recursive-descent pass distinguishes candidates on known control-flow paths from
-    // candidates found only by decoding every byte. Keep the existing full table and rejection
-    // policy until indirect edges and unlabelled entry points are accounted for.
-    let reachable = scan_reachable(&linked.segments, &linked.image, &linked.roots);
-    let reachable_offsets: HashSet<u64> = reachable.iter().map(|site| site.offset).collect();
-    let reachable_avx2 = reachable.iter().filter(|site| site.kind.set() == "AVX2").count();
-    let reachable_unsupported = reachable.iter()
+    // Run CFG analysis in two tiers. Entry/init/function-binding roots are stronger evidence;
+    // relocation-derived addresses are retained as a weaker superset because not every
+    // relocation into executable memory denotes a function entry.
+    let mut strong_roots = linked.roots.entry_and_init.clone();
+    strong_roots.extend(linked.roots.function_bindings.iter().copied());
+    normalize_roots(&mut strong_roots, &linked.segments);
+
+    let strong_reachable = scan_reachable(&linked.segments, &linked.image, &strong_roots);
+    let mut all_roots = strong_roots.clone();
+    all_roots.extend(linked.roots.relocation_candidates.iter().copied());
+    normalize_roots(&mut all_roots, &linked.segments);
+    let all_reachable = scan_reachable(&linked.segments, &linked.image, &all_roots);
+
+    let strong_avx2 = strong_reachable.iter().filter(|site| site.kind.set() == "AVX2").count();
+    let strong_unsupported = strong_reachable.iter()
         .filter(|site| site.kind.set() == "AVX2" && site.mode == Mode::Unsupported).count();
-    let linear_unsupported = sites.iter()
+    let all_avx2 = all_reachable.iter().filter(|site| site.kind.set() == "AVX2").count();
+    let all_unsupported = all_reachable.iter()
         .filter(|site| site.kind.set() == "AVX2" && site.mode == Mode::Unsupported).count();
+    let all_offsets: HashSet<u64> = all_reachable.iter().map(|site| site.offset).collect();
     let linear_only_unsupported = sites.iter()
         .filter(|site| site.kind.set() == "AVX2" && site.mode == Mode::Unsupported &&
-                       !reachable_offsets.contains(&site.offset)).count();
+                       !all_offsets.contains(&site.offset)).count();
+    let weak_roots = all_roots.len().saturating_sub(strong_roots.len());
 
     let table = encode_table(&linked.image, &sites)?;
     fs::create_dir_all(out).map_err(|e| format!("{}: {e}", out.display()))?;
@@ -628,10 +648,12 @@ fn scan(boot: &Path, out: &Path) -> Result<String, String> {
     let unsupported = sites.iter().filter(|s| s.mode == Mode::Unsupported).count();
     Ok(format!(
         "CPU missing {}; ISA: {} sites (MOVBE {}, BMI1 {}, LZCNT {}, AVX2 {}); {} relocated, {} int3, {} unsupported\n\
-         ISA CFG: {} roots, {} reachable AVX2 sites ({} unsupported); {} unsupported AVX2 candidates only in linear sweep",
+         ISA CFG: {} strong roots ({} entry/init, {} function bindings): {} AVX2 ({} unsupported); +{} relocation roots: {} AVX2 ({} unsupported); {} unsupported only in linear sweep",
         missing.join(", "), sites.len(), count_set("MOVBE"), count_set("BMI1"), count_set("LZCNT"),
-        count_set("AVX2"), relocated, int3, unsupported, linked.roots.len(), reachable_avx2,
-        reachable_unsupported, linear_only_unsupported
+        count_set("AVX2"), relocated, int3, unsupported, strong_roots.len(),
+        linked.roots.entry_and_init.len(), linked.roots.function_bindings.len(), strong_avx2,
+        strong_unsupported, weak_roots, all_avx2.saturating_sub(strong_avx2),
+        all_unsupported.saturating_sub(strong_unsupported), linear_only_unsupported
     ))
 }
 
@@ -689,13 +711,52 @@ mod tests {
         assert_eq!(linked.segments[0].size, code.len() as u64);
         assert_eq!(linked.segments[0].flags & 1, 1);
         assert_eq!(linked.image, code);
-        assert_eq!(linked.roots, vec![0]);
+        assert_eq!(linked.roots.entry_and_init, vec![0]);
+        assert!(linked.roots.function_bindings.is_empty());
+        assert!(linked.roots.relocation_candidates.is_empty());
 
         let sites = scan_segment(&linked.image, 0);
         assert_eq!(sites.len(), 3);
         assert_eq!(sites[0].kind, Kind::MovbeStore);
         assert_eq!(sites[1].kind, Kind::Blsr);
         assert_eq!(sites[2].kind, Kind::Lzcnt);
+    }
+
+    #[test]
+    fn keeps_relocation_targets_separate_from_strong_cfg_roots() {
+        // RET at address 0 terminates the entry path. The relocation points at the following
+        // bytes, which decode as VPADDD, but that address is only a weak candidate root.
+        let code = bytes("c3c5f5fec2");
+        let size = code.len() as u64;
+        let words = [
+            size, 0, 1, 1, 0, 1,       // BBPROBE5 header: one relocation
+            0, 0, 0, 0,                 // procparam and main TLS
+            1,                           // one module
+            0, size, 0, 0, 0, 0, 0,    // module metadata
+            0,                           // no native bindings
+            0, size, 5,                  // executable segment
+            0, 0, 1, 0,                  // relative relocation: target=0, value=1
+        ];
+        let mut boot = b"BBPROBE5".to_vec();
+        for word in words {
+            boot.extend_from_slice(&word.to_le_bytes());
+        }
+        boot.extend_from_slice(&code);
+
+        let linked = read_boot_linked(&boot).unwrap();
+        assert_eq!(linked.roots.entry_and_init, vec![0]);
+        assert_eq!(linked.roots.relocation_candidates, vec![1]);
+
+        let strong = scan_reachable(&linked.segments, &linked.image, &linked.roots.entry_and_init);
+        assert!(strong.is_empty());
+
+        let expanded = scan_reachable(
+            &linked.segments,
+            &linked.image,
+            &linked.roots.relocation_candidates
+        );
+        assert_eq!(expanded.len(), 1);
+        assert_eq!(expanded[0].kind, Kind::Avx2Unsupported);
     }
 
     #[test]
