@@ -638,8 +638,8 @@ static LONG CALLBACK vectored_handler(EXCEPTION_POINTERS *e) {
         int length = isa_rewrite_describe_fault(isa_table, (uintptr_t)e->ContextRecord->Rip,
                                                 diagnostic, sizeof(diagnostic));
         if (length > 0) fwrite(diagnostic, 1, (size_t)length, stderr);
-        else fputs("ISA diagnostic: host CPU raised #UD while executing guest code; no scanner record matched.\\n", stderr);
-        fputs("ISA diagnostic: stopping deliberately at the first unsupported instruction.\\n", stderr);
+        else fputs("ISA diagnostic: host CPU raised #UD while executing guest code; no scanner record matched.\n", stderr);
+        fputs("ISA diagnostic: stopping deliberately at the first unsupported instruction.\n", stderr);
         fflush(stderr);
         report_exception(e);
         write_crash_dump(e);
@@ -1118,7 +1118,7 @@ int main(int argc, char **argv) {
         if (report.unsupported_needed)
             fail("the linked image contains MOVBE/BMI1/LZCNT/AVX2 encodings that this compatibility layer cannot rewrite");
         if (report.diagnostic_avx2)
-            printf("ISA diagnostic: %u unsupported AVX2 candidates left untouched for runtime validation\\n",
+            printf("ISA diagnostic: %u unsupported AVX2 candidates left untouched for runtime validation\n",
                    report.diagnostic_avx2);
         if (isa_stubs && isa_stubs_size) protect(isa_stubs, isa_stubs_size, 5);
         printf("ISA: rewrote %u sites (%u jmp, %u relocated, %u int3); %u changed sites skipped\n",
