@@ -584,6 +584,14 @@ mod tests {
         assert_eq!(ymm_site.dst, 0);
         assert_eq!(ymm_site.src1, 1);
         assert_ne!(ymm_site.mode, Mode::Unsupported);
+
+        // High vector register numbers must be normalized to the 0-15 YMM/XMM index range.
+        let high_site = scan_segment(&bytes("c4427d20ca"), 0x2200).remove(0);
+        assert_eq!(high_site.kind, Kind::Vpmovsxbw);
+        assert_eq!(high_site.width, 32);
+        assert_eq!(high_site.dst, 9);
+        assert_eq!(high_site.src1, 10);
+        assert_ne!(high_site.mode, Mode::Unsupported);
     }
 
 
