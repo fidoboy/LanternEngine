@@ -628,10 +628,29 @@ fn scan(boot: &Path, out: &Path) -> Result<String, String> {
     let all_unsupported = all_reachable.iter()
         .filter(|site| site.kind.set() == "AVX2" && site.mode == Mode::Unsupported).count();
     let all_offsets: HashSet<u64> = all_reachable.iter().map(|site| site.offset).collect();
+    let strong_offsets: HashSet<u64> = strong_reachable.iter().map(|site| site.offset).collect();
     let linear_only_unsupported = sites.iter()
         .filter(|site| site.kind.set() == "AVX2" && site.mode == Mode::Unsupported &&
                        !all_offsets.contains(&site.offset)).count();
     let weak_roots = all_roots.len().saturating_sub(strong_roots.len());
+    let cfg_unsupported: Vec<String> = all_reachable.iter()
+        .filter(|site| site.kind.set() == "AVX2" && site.mode == Mode::Unsupported)
+        .take(16)
+        .map(|site| {
+            let length = usize::from(site.length).min(site.original.len());
+            let bytes = site.original[..length].iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let provenance = if strong_offsets.contains(&site.offset) { "strong" } else { "relocation" };
+            format!("ISA CFG: {provenance}-reachable unsupported AVX2 at +0x{:x} bytes: {bytes}", site.offset)
+        })
+        .collect();
+    let cfg_detail = if cfg_unsupported.is_empty() {
+        String::new()
+    } else {
+        format!("\\n{}", cfg_unsupported.join("\\n"))
+    };
 
     let table = encode_table(&linked.image, &sites)?;
     fs::create_dir_all(out).map_err(|e| format!("{}: {e}", out.display()))?;
@@ -649,12 +668,12 @@ fn scan(boot: &Path, out: &Path) -> Result<String, String> {
     let unsupported = sites.iter().filter(|s| s.mode == Mode::Unsupported).count();
     Ok(format!(
         "CPU missing {}; ISA: {} sites (MOVBE {}, BMI1 {}, LZCNT {}, AVX2 {}); {} relocated, {} int3, {} unsupported\n\
-         ISA CFG: {} strong roots ({} entry/init, {} function bindings): {} AVX2 ({} unsupported); +{} relocation roots: {} AVX2 ({} unsupported); {} unsupported only in linear sweep",
+         ISA CFG: {} strong roots ({} entry/init, {} function bindings): {} AVX2 ({} unsupported); +{} relocation roots: {} AVX2 ({} unsupported); {} unsupported only in linear sweep{}",
         missing.join(", "), sites.len(), count_set("MOVBE"), count_set("BMI1"), count_set("LZCNT"),
         count_set("AVX2"), relocated, int3, unsupported, strong_roots.len(),
         linked.roots.entry_and_init.len(), linked.roots.function_bindings.len(), strong_avx2,
         strong_unsupported, weak_roots, all_avx2.saturating_sub(strong_avx2),
-        all_unsupported.saturating_sub(strong_unsupported), linear_only_unsupported
+        all_unsupported.saturating_sub(strong_unsupported), linear_only_unsupported, cfg_detail
     ))
 }
 
