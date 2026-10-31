@@ -278,9 +278,23 @@ IsaReport isa_rewrite_apply(IsaTable *t, unsigned char *image, unsigned char *st
     t->image = image;
     t->stubs = stubs;
     isa_emulate_set_image(image);
-    for (uint32_t i = 0; i < t->count; i++)
-        if (t->sites[i].mode == ISA_MODE_UNSUPPORTED && (isa_site_set(&t->sites[i]) & sets)) report.unsupported_needed++;
-    if (report.unsupported_needed) return report;
+    uint32_t unsupported_shown = 0;
+    for (uint32_t i = 0; i < t->count; i++) {
+        const IsaSite *s = &t->sites[i];
+        if (s->mode != ISA_MODE_UNSUPPORTED || !(isa_site_set(s) & sets)) continue;
+        report.unsupported_needed++;
+        if (unsupported_shown++ < 16) {
+            fprintf(stderr, "ISA: unsupported %s at +0x%llx bytes:",
+                    isa_kind_name(s->kind), (unsigned long long)s->offset);
+            for (unsigned byte = 0; byte < s->length; ++byte) fprintf(stderr, " %02x", s->original[byte]);
+            fputc('\\n', stderr);
+        }
+    }
+    if (report.unsupported_needed) {
+        if (report.unsupported_needed > 16)
+            fprintf(stderr, "ISA: %u additional unsupported sites omitted\\n", report.unsupported_needed - 16);
+        return report;
+    }
     for (uint32_t i = 0; i < t->count; i++) {
         const IsaSite *s = &t->sites[i];
         if (s->mode == ISA_MODE_UNSUPPORTED || !(isa_site_set(s) & sets)) continue;
