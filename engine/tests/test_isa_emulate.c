@@ -7,7 +7,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include "isa_emulate.h"
+#include "isa_rewrite.h"
 #include <cpuid.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 static int host_has_required_isa(void) {
     unsigned a = 0, b = 0, c = 0, d = 0, leaf1 = 0, leaf7 = 0, ext1 = 0;
@@ -284,6 +287,106 @@ static void check_memory_sources(void) {
 }
 
 
+
+static int host_has_avx_state(void) {
+    unsigned a = 0, b = 0, c = 0, d = 0;
+    if (!__get_cpuid(1, &a, &b, &c, &d)) return 0;
+    if (!(c & (1u << 27)) || !(c & (1u << 28))) return 0; /* OSXSAVE and AVX */
+    unsigned lo, hi;
+    __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
+    return (lo & 6) == 6;
+}
+
+/* Execute the generated AVX1 save/restore stub around a rewritten AVX2 instruction. */
+static void check_vector_stub_execution(void) {
+    if (!host_has_avx_state()) {
+        puts("isa-emulate-test: vector stub execution skipped (OS AVX state unavailable)");
+        return;
+    }
+    long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) {
+        puts("isa-emulate-test FAILED: cannot determine page size");
+        exit(1);
+    }
+    size_t allocation_size = (size_t)page_size * 2;
+    unsigned char *region = mmap(NULL, allocation_size, PROT_READ | PROT_WRITE,
+                                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (region == MAP_FAILED) {
+        puts("isa-emulate-test FAILED: mmap for vector stub");
+        exit(1);
+    }
+
+    uint8_t source[32], source_after[32], destination_seed[32], result[32];
+    for (unsigned i = 0; i < 32; ++i) {
+        source[i] = (uint8_t)(0x80 + i * 7);
+        destination_seed[i] = (uint8_t)(0x5a ^ i);
+    }
+
+    for (unsigned width = 16; width <= 32; width += 16) {
+        if (mprotect(region, allocation_size, PROT_READ | PROT_WRITE) != 0) {
+            puts("isa-emulate-test FAILED: mprotect writable");
+            exit(1);
+        }
+        memset(region, 0x90, allocation_size);
+        const uint8_t instruction[5] = {
+            0xc4, 0xe2, (uint8_t)(width == 16 ? 0x79 : 0x7d), 0x20, 0xc1
+        }; /* VPMOVSXBW xmm0/ymm0, xmm1 */
+        memcpy(region, instruction, sizeof instruction);
+        region[5] = 0xc3; /* ret */
+
+        IsaSite site = {0};
+        site.length = 5;
+        site.kind = ISA_VPMOVSXBW;
+        site.width = (uint8_t)width;
+        site.mode = ISA_MODE_JMP;
+        site.dst = 0;
+        site.src1 = 1;
+        site.src2 = ISA_NO_REG;
+        site.mem_slot = ISA_MEM_NONE;
+        site.base = site.index = ISA_NO_REG;
+        site.scale = 1;
+        memcpy(site.original, instruction, sizeof instruction);
+
+        uint64_t hit = 0;
+        IsaTable table = {0};
+        table.sites = &site;
+        table.hits = &hit;
+        table.count = 1;
+        IsaReport report = isa_rewrite_apply(&table, region, region + page_size, CPU_SET_AVX2);
+        if (report.rewritten != 1 || report.unsupported_needed != 0) {
+            puts("isa-emulate-test FAILED: AVX2 site was not rewritten");
+            exit(1);
+        }
+        if (mprotect(region, allocation_size, PROT_READ | PROT_EXEC) != 0) {
+            puts("isa-emulate-test FAILED: mprotect executable");
+            exit(1);
+        }
+
+        __asm__ volatile("vmovdqu %0, %%ymm1" : : "m"(*(const uint8_t (*)[32])source) : "ymm1", "memory");
+        __asm__ volatile("vmovdqu %0, %%ymm0" : : "m"(*(const uint8_t (*)[32])destination_seed) : "ymm0", "memory");
+        ((void (*)(void))region)();
+        __asm__ volatile("vmovdqu %%ymm0, %0" : "=m"(*(uint8_t (*)[32])result) : : "ymm0", "memory");
+        __asm__ volatile("vmovdqu %%ymm1, %0" : "=m"(*(uint8_t (*)[32])source_after) : : "ymm1", "memory");
+
+        unsigned elements = width / 2;
+        for (unsigned i = 0; i < elements; ++i) {
+            uint16_t expected = (uint16_t)(int16_t)(int8_t)source[i];
+            if (result[i * 2] != (uint8_t)expected ||
+                result[i * 2 + 1] != (uint8_t)(expected >> 8))
+                fail(ISA_VPMOVSXBW, width, i, source[i], "generated stub result",
+                     (uint8_t)expected, result[i * 2]);
+        }
+        if (width == 16) {
+            for (unsigned i = 16; i < 32; ++i)
+                if (result[i] != 0)
+                    fail(ISA_VPMOVSXBW, width, i, 0, "generated stub upper YMM", 0, result[i]);
+        }
+        if (memcmp(source, source_after, sizeof source) != 0)
+            fail(ISA_VPMOVSXBW, width, 0, 0, "generated stub source YMM preservation", source[0], source_after[0]);
+    }
+    munmap(region, allocation_size);
+}
+
 static void vector_shape(uint8_t kind, unsigned *source_bytes, unsigned *destination_bytes, int *is_signed) {
     static const uint8_t source_sizes[6] = {1, 1, 1, 2, 2, 4};
     static const uint8_t destination_sizes[6] = {2, 4, 8, 4, 8, 8};
@@ -379,6 +482,7 @@ static void check_vector_extensions(void) {
 }
 
 int main(void) {
+    check_vector_stub_execution();
     check_vector_extensions();
     if (!host_has_required_isa()) {
         puts("isa-emulate-test skipped: CPU lacks BMI1, LZCNT or MOVBE");
