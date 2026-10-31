@@ -287,12 +287,12 @@ IsaReport isa_rewrite_apply(IsaTable *t, unsigned char *image, unsigned char *st
             fprintf(stderr, "ISA: unsupported %s at +0x%llx bytes:",
                     isa_kind_name(s->kind), (unsigned long long)s->offset);
             for (unsigned byte = 0; byte < s->length; ++byte) fprintf(stderr, " %02x", s->original[byte]);
-            fputc('\\n', stderr);
+            fputc('\n', stderr);
         }
     }
     if (report.unsupported_needed) {
         if (report.unsupported_needed > 16)
-            fprintf(stderr, "ISA: %u additional unsupported sites omitted\\n", report.unsupported_needed - 16);
+            fprintf(stderr, "ISA: %u additional unsupported sites omitted\n", report.unsupported_needed - 16);
         return report;
     }
     for (uint32_t i = 0; i < t->count; i++) {
