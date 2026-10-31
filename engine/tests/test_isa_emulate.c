@@ -363,7 +363,7 @@ static void check_vector_stub_execution(void) {
         memset(region, 0x90, allocation_size);
         const uint8_t instruction[5] = {
             0xc4, 0x42, (uint8_t)(width == 16 ? 0x79 : 0x7d), 0x20, 0xca
-        }; /* VPMOVSXBW xmm0/ymm0, xmm1 */
+        }; /* VPMOVSXBW xmm9/ymm9, xmm10 */
         memcpy(region, instruction, sizeof instruction);
         region[5] = 0xc3; /* ret */
 
