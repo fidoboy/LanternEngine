@@ -820,18 +820,29 @@ mod tests {
 
         let linked = read_boot_linked(&boot).unwrap();
         assert_eq!(linked.roots.entry_and_init, vec![0]);
-        assert_eq!(linked.roots.relocation_candidates, vec![1]);
+        assert_eq!(linked.roots.relocation_candidates.len(), 1);
+        assert_eq!(linked.roots.relocation_candidates[0].address, 1);
+        assert_eq!(linked.roots.relocation_candidates[0].target, 0);
 
         let strong = scan_reachable(&linked.segments, &linked.image, &linked.roots.entry_and_init);
         assert!(strong.is_empty());
 
+        let weak_roots: Vec<u64> = linked.roots.relocation_candidates.iter()
+            .map(|root| root.address)
+            .collect();
         let expanded = scan_reachable(
             &linked.segments,
             &linked.image,
-            &linked.roots.relocation_candidates
+            &weak_roots
         );
         assert_eq!(expanded.len(), 1);
         assert_eq!(expanded[0].kind, Kind::Avx2Unsupported);
+
+        let traced = scan_reachable_traced(&linked.segments, &linked.image, &weak_roots);
+        assert_eq!(traced.len(), 1);
+        assert_eq!(traced[0].root, 1);
+        assert_eq!(traced[0].predecessor, None);
+        assert_eq!(traced[0].site.kind, Kind::Avx2Unsupported);
     }
 
     #[test]
