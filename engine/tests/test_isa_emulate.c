@@ -514,7 +514,50 @@ static void check_vector_extensions(void) {
     }
 }
 
+static void check_avx2_diagnostic_mode(void) {
+    static const unsigned char instruction[4] = {0xc5, 0xdd, 0xf2, 0x10};
+    unsigned char image[32] = {0};
+    memcpy(image + 8, instruction, sizeof instruction);
+    IsaSite site = {0};
+    site.offset = 8;
+    site.length = sizeof instruction;
+    site.kind = ISA_AVX2_UNSUPPORTED;
+    site.mode = ISA_MODE_UNSUPPORTED;
+    memcpy(site.original, instruction, sizeof instruction);
+    uint64_t hit = 0;
+    IsaTable table = {0};
+    table.sites = &site;
+    table.hits = &hit;
+    table.count = 1;
+    table.image_size = sizeof image;
+
+    IsaReport strict = isa_rewrite_apply(&table, image, NULL, CPU_SET_AVX2, 0);
+    if (strict.unsupported_needed != 1 || strict.diagnostic_avx2 != 0) {
+        puts("isa-emulate-test FAILED: strict mode must reject an unsupported AVX2 site");
+        exit(1);
+    }
+    IsaReport diagnostic = isa_rewrite_apply(&table, image, NULL, CPU_SET_AVX2, 1);
+    if (diagnostic.unsupported_needed != 0 || diagnostic.diagnostic_avx2 != 1) {
+        puts("isa-emulate-test FAILED: diagnostic mode must leave unsupported AVX2 sites untouched");
+        exit(1);
+    }
+    if (memcmp(image + 8, instruction, sizeof instruction) != 0) {
+        puts("isa-emulate-test FAILED: diagnostic mode modified the unsupported instruction");
+        exit(1);
+    }
+
+    char description[512];
+    int length = isa_rewrite_describe_fault(&table, (uintptr_t)(image + 8),
+                                            description, sizeof description);
+    if (length <= 0 || !strstr(description, "guest +0x8") ||
+        !strstr(description, "avx2-unsupported") || !strstr(description, "c5 dd f2 10")) {
+        puts("isa-emulate-test FAILED: runtime #UD report lacks the site and instruction bytes");
+        exit(1);
+    }
+}
+
 int main(void) {
+    check_avx2_diagnostic_mode();
     check_vector_stub_execution();
     check_vector_extensions();
     if (!host_has_required_isa()) {
