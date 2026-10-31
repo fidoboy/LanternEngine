@@ -61,7 +61,7 @@ static uint64_t byte_swap(const IsaSite *site, uint64_t value) {
     return __builtin_bswap64(value);
 }
 
-/* The VPMOVSX*/VPMOVZX* family differs only in source/destination element sizes
+/* The VPMOVSX and VPMOVZX families differ only in source/destination element sizes
  * and whether the source element is sign-extended. All forms write XMM or YMM,
  * read only the low source bytes, and zero the upper YMM half for a 128-bit result. */
 static void emulate_vector_extension(const IsaSite *site, IsaRegs *regs) {
