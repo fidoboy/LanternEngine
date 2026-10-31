@@ -122,3 +122,8 @@ jobs:
             -Iengine/src -c engine/src/isa_emulate.c -o "$RUNNER_TEMP/isa_emulate.obj"
           clang -std=gnu11 -O2 -Wall -Wextra -Werror \
             -Iengine/src -c engine/src/isa_rewrite.c -o "$RUNNER_TEMP/isa_rewrite.obj"
+          clang -std=gnu11 -O2 -Wall -Wextra -Werror -mgeneral-regs-only \
+            -D_WIN32_WINNT=0x0A00 -Iengine/src \
+            engine/tests/test_isa_emulate.c engine/src/isa_emulate.c engine/src/isa_rewrite.c \
+            -o "$RUNNER_TEMP/test-isa-emulate.exe"
+          "$RUNNER_TEMP/test-isa-emulate.exe"
