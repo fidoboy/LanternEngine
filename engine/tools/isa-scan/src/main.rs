@@ -85,10 +85,6 @@ impl Kind {
         }
     }
 
-    fn is_avx2(self) -> bool {
-        self.set() == "AVX2"
-    }
-
     fn is_vector_conversion(self) -> bool {
         matches!(self,
             Self::Vpmovsxbw | Self::Vpmovsxbd | Self::Vpmovsxbq | Self::Vpmovsxwd |
