@@ -329,6 +329,7 @@ static int protect_test_pages(unsigned char *region, size_t size, int writable) 
 
 static void release_test_pages(unsigned char *region, size_t allocation_size) {
 #ifdef _WIN32
+    (void)allocation_size;
     VirtualFree(region, 0, MEM_RELEASE);
 #else
     munmap(region, allocation_size);
