@@ -178,8 +178,11 @@ static void fault(int sig, siginfo_t *info, void *context) {
     if (sig == SIGILL && isa_diagnostic && isa_table) {
         char diagnostic[512];
         int length = isa_rewrite_describe_fault(isa_table, rip, diagnostic, sizeof(diagnostic));
-        if (length > 0) { ssize_t written_ = write(2, diagnostic, (size_t)length); (void)written_; }
-        _exit(128 + sig);
+        if (length > 0) {
+            ssize_t written_ = write(2, diagnostic, (size_t)length);
+            (void)written_;
+            _exit(128 + sig);
+        }
     }
     if (sig == SIGTRAP && isa_table && rip) {
         IsaRegs regs = {0};
