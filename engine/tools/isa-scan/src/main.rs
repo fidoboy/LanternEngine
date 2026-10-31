@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Adapted from SpartanPort's iced-x86 scanner:
 // https://github.com/FelipePrado0/SpartanPort/blob/main/launcher-rust/src/runner/isa_rewrite.rs
-// Modified for Lantern Engine on 2026-10-31: read BBPROBE5, emit MOVBE/BMI1/LZCNT only,
-// and skip scanning entirely when the host supports all three sets.
+// Modified for Lantern Engine: read BBPROBE5, rewrite MOVBE/BMI1/LZCNT and selected AVX2
+// integer conversions, and fail closed on other AVX2 instructions when the host lacks AVX2.
 
 
 use std::collections::HashSet;
@@ -580,6 +580,19 @@ mod tests {
         assert_eq!(sites[11].kind, Kind::Vpmovzxdq);
         assert!(sites.iter().all(|site| site.width == 16 && site.dst == 0 && site.src1 == 1));
         assert!(sites.iter().all(|site| site.mode != Mode::Unsupported));
+    }
+
+
+    #[test]
+    fn marks_other_avx2_instructions_unsupported() {
+        // VPADDD ymm0, ymm1, ymm2: an AVX2 instruction not yet emulated.
+        let sites = scan_segment(&bytes("c5f5fec2"), 0x3000);
+        assert_eq!(sites.len(), 1);
+        assert_eq!(sites[0].kind, Kind::Avx2Unsupported);
+        assert_eq!(sites[0].mode, Mode::Unsupported);
+        assert_eq!(sites[0].dst, NO_REG);
+        assert_eq!(sites[0].src1, NO_REG);
+        assert_eq!(sites[0].src2, NO_REG);
     }
 
     #[test]
