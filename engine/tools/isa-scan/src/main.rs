@@ -164,8 +164,15 @@ struct ScanRoots {
     relocation_candidates: Vec<RelocationRoot>,
 }
 
+#[derive(Clone, Copy)]
+struct ModuleRange {
+    base: u64,
+    size: u64,
+}
+
 struct LinkedImage {
     segments: Vec<Segment>,
+    modules: Vec<ModuleRange>,
     image: Vec<u8>,
     roots: ScanRoots,
 }
@@ -180,6 +187,56 @@ fn executable_address(address: u64, segments: &[Segment]) -> bool {
     segments.iter().any(|s| {
         s.flags & 1 != 0 && address >= s.address && address - s.address < s.size
     })
+}
+
+fn segment_flags_at(address: u64, segments: &[Segment]) -> Option<u64> {
+    segments.iter().find(|s| address >= s.address && address - s.address < s.size)
+        .map(|s| s.flags)
+}
+
+fn module_index_at(address: u64, modules: &[ModuleRange]) -> Option<usize> {
+    modules.iter().position(|m| address >= m.base && address - m.base < m.size)
+}
+
+fn describe_instruction(image: &[u8], address: u64) -> String {
+    let Ok(offset) = usize::try_from(address) else {
+        return format!("+0x{address:x}: out-of-range");
+    };
+    let Some(code) = image.get(offset..) else {
+        return format!("+0x{address:x}: out-of-range");
+    };
+    let Ok(mut decoder) = Decoder::try_with_ip(64, code, address, DecoderOptions::NONE) else {
+        return format!("+0x{address:x}: decoder unavailable");
+    };
+    let ins = decoder.decode();
+    if ins.code() == Code::INVALID {
+        return format!("+0x{address:x}: invalid");
+    }
+    let length = decoder.position().min(code.len());
+    let bytes = code[..length].iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let branch = match ins.op0_kind() {
+        OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64 =>
+            format!(" -> +0x{:x}", ins.near_branch_target()),
+        _ => String::new(),
+    };
+    let operands = (0..ins.op_count())
+        .map(|index| match ins.op_kind(index) {
+            OpKind::Register => format!("{:?}", ins.op_register(index)),
+            OpKind::Memory => format!(
+                "[{:?}+{:?}*{}+{:#x}]",
+                ins.memory_base(), ins.memory_index(), ins.memory_index_scale(),
+                ins.memory_displacement64()
+            ),
+            OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64 =>
+                format!("+0x{:x}", ins.near_branch_target()),
+            _ => format!("{:?}", ins.op_kind(index)),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("+0x{address:x}: {:?} {operands}{branch} [{bytes}]", ins.mnemonic())
 }
 
 fn read_boot_linked(data: &[u8]) -> Result<LinkedImage, String> {
@@ -208,14 +265,16 @@ fn read_boot_linked(data: &[u8]) -> Result<LinkedImage, String> {
     }
 
     let mut roots = ScanRoots { entry_and_init: vec![entry], ..ScanRoots::default() };
+    let mut modules = Vec::with_capacity(module_count as usize);
     for _ in 0..module_count {
-        let _base = take_u64(data, &mut at)?;
-        let _size = take_u64(data, &mut at)?;
+        let base = take_u64(data, &mut at)?;
+        let size = take_u64(data, &mut at)?;
         let init = take_u64(data, &mut at)?;
         let _tls_address = take_u64(data, &mut at)?;
         let _tls_memsz = take_u64(data, &mut at)?;
         let _tls_filesz = take_u64(data, &mut at)?;
         let _tls_module = take_u64(data, &mut at)?;
+        modules.push(ModuleRange { base, size });
         if init != 0 {
             roots.entry_and_init.push(init);
         }
@@ -272,7 +331,7 @@ fn read_boot_linked(data: &[u8]) -> Result<LinkedImage, String> {
     roots.relocation_candidates.sort_by_key(|root| (root.address, root.target));
     roots.relocation_candidates.dedup_by_key(|root| (root.address, root.target));
 
-    Ok(LinkedImage { segments, image: data[at..end].to_vec(), roots })
+    Ok(LinkedImage { segments, modules, image: data[at..end].to_vec(), roots })
 }
 
 fn kind_of(ins: &Instruction) -> Option<Kind> {
@@ -452,7 +511,8 @@ fn scan_segment(code: &[u8], address: u64) -> Vec<Site> {
 struct ReachableSite {
     site: Site,
     root: u64,
-    predecessor: Option<u64>,
+    edge_from: Option<u64>,
+    previous_instruction: Option<u64>,
 }
 
 // Recursive-descent control-flow scan used as a second opinion on the linear sweep.
@@ -469,7 +529,7 @@ fn scan_reachable_traced(
     let mut decoded = HashSet::new();
     let mut sites: HashMap<u64, ReachableSite> = HashMap::new();
 
-    while let Some((start, root, initial_predecessor)) = queue.pop_front() {
+    while let Some((start, root, edge_from)) = queue.pop_front() {
         let Some(segment) = segments.iter().find(|s| {
             s.flags & 1 != 0 && start >= s.address && start - s.address < s.size
         }) else {
@@ -484,7 +544,7 @@ fn scan_reachable_traced(
         let Ok(mut decoder) = Decoder::try_with_ip(64, code, start, DecoderOptions::NONE) else {
             continue;
         };
-        let mut predecessor = initial_predecessor;
+        let mut previous_instruction = edge_from;
 
         while decoder.can_decode() {
             let byte_start = decoder.position();
@@ -500,7 +560,8 @@ fn scan_reachable_traced(
                 sites.entry(ins.ip()).or_insert_with(|| ReachableSite {
                     site: site_of(&ins, kind, bytes),
                     root,
-                    predecessor,
+                    edge_from,
+                    previous_instruction,
                 });
             }
 
@@ -542,7 +603,7 @@ fn scan_reachable_traced(
                 FlowControl::IndirectBranch | FlowControl::Return |
                 FlowControl::Interrupt | FlowControl::Exception => break,
             }
-            predecessor = Some(ins.ip());
+            previous_instruction = Some(ins.ip());
         }
     }
 
@@ -682,22 +743,32 @@ fn scan(boot: &Path, out: &Path) -> Result<String, String> {
             } else {
                 "relocation"
             };
-            let relocation_slots: Vec<String> = linked.roots.relocation_candidates.iter()
+            let relocation_context = linked.roots.relocation_candidates.iter()
                 .filter(|root| root.address == entry.root)
                 .take(4)
-                .map(|root| format!("+0x{:x}", root.target))
-                .collect();
-            let source = if relocation_slots.is_empty() {
-                String::new()
-            } else {
-                format!(" (relocation slot(s): {})", relocation_slots.join(", "))
-            };
-            let predecessor = entry.predecessor
-                .map(|address| format!(" via +0x{address:x}"))
-                .unwrap_or_default();
+                .map(|root| {
+                    let flags = segment_flags_at(root.target, &linked.segments)
+                        .map(|flags| format!("flags=0x{flags:x}"))
+                        .unwrap_or_else(|| "outside-segments".into());
+                    let module = module_index_at(root.target, &linked.modules)
+                        .map(|index| format!("module#{index}"))
+                        .unwrap_or_else(|| "no-module".into());
+                    format!("slot +0x{:x} [{flags}, {module}]", root.target)
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let root_module = module_index_at(entry.root, &linked.modules)
+                .map(|index| format!("module#{index}"))
+                .unwrap_or_else(|| "no-module".into());
+            let edge = entry.edge_from
+                .map(|address| format!("edge from {}", describe_instruction(&linked.image, address)))
+                .unwrap_or_else(|| "entry from relocation root".into());
+            let previous = entry.previous_instruction
+                .map(|address| format!("previous {}", describe_instruction(&linked.image, address)))
+                .unwrap_or_else(|| "no previous instruction".into());
             format!(
-                "ISA CFG: {provenance} root +0x{:x}{source}{predecessor} reaches unsupported AVX2 at +0x{:x} bytes: {bytes}",
-                entry.root, site.offset
+                "ISA CFG: {provenance} root +0x{:x} [{root_module}] ({relocation_context}); {}; {}; site {}",
+                entry.root, edge, previous, describe_instruction(&linked.image, site.offset)
             )
         })
         .collect();
@@ -844,7 +915,8 @@ mod tests {
         let traced = scan_reachable_traced(&linked.segments, &linked.image, &weak_roots);
         assert_eq!(traced.len(), 1);
         assert_eq!(traced[0].root, 1);
-        assert_eq!(traced[0].predecessor, None);
+        assert_eq!(traced[0].edge_from, None);
+        assert_eq!(traced[0].previous_instruction, None);
         assert_eq!(traced[0].site.kind, Kind::Avx2Unsupported);
     }
 
