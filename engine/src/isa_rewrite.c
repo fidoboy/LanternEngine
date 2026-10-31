@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only
  * Adapted from SpartanPort (https://github.com/FelipePrado0/SpartanPort).
- * Modified for Lantern Engine on 2026-10-31: loader and stubs handle MOVBE/BMI1/LZCNT only. */
+ * Modified for Lantern Engine: loader and stubs also handle selected AVX2 conversions. */
 #include "isa_rewrite.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -69,17 +69,24 @@ static uint32_t read_u32(const unsigned char *p) {
 }
 
 static int register_valid(uint8_t reg) { return reg <= 15 || reg == ISA_NO_REG; }
+static int vector_kind(uint8_t kind) { return kind >= ISA_VPMOVSXBW && kind <= ISA_VPMOVZXDQ; }
 
 /* Field ranges of spec 4.4, plus what the patch writes: a 5-byte jmp needs a 5-byte site (mode 0)
  * or a relocated instruction (mode 1), an int3 site is 4 bytes, and every write stays inside the image.
  * The writer stores scale 0 without a memory operand, else iced's scale (1 when there is no index). */
 static int record_valid(const IsaSite *s, uint64_t image_size) {
     if (s->length < 4 || s->length > 15 || s->relocated_length > 15) return 0;
-    if (s->kind < ISA_MOVBE_LOAD || s->kind > ISA_BLSR || s->mode > ISA_MODE_UNSUPPORTED) return 0;
+    if (s->kind < ISA_MOVBE_LOAD || s->kind > ISA_AVX2_UNSUPPORTED || s->mode > ISA_MODE_UNSUPPORTED) return 0;
     if (!register_valid(s->dst) || !register_valid(s->src1) || !register_valid(s->src2) || !register_valid(s->base) ||
         !register_valid(s->index) || s->mem_slot > ISA_MEM_SRC)
         return 0;
-    if (s->kind <= ISA_BLSR && s->width != 16 && s->width != 32 && s->width != 64) return 0;
+    if (vector_kind(s->kind)) {
+        if ((s->width != 16 && s->width != 32) || s->dst >= 16) return 0;
+        if (s->src1 == ISA_NO_REG && s->mem_slot != ISA_MEM_SRC) return 0;
+    } else if (s->kind != ISA_AVX2_UNSUPPORTED &&
+               s->width != 16 && s->width != 32 && s->width != 64) {
+        return 0;
+    }
     if (s->scale != 1 && s->scale != 2 && s->scale != 4 && s->scale != 8 && !(s->scale == 0 && s->index == ISA_NO_REG))
         return 0;
     if (s->mode == ISA_MODE_JMP && s->length < JMP_BYTES) return 0;
@@ -148,6 +155,10 @@ unsigned isa_site_set(const IsaSite *s) {
     case ISA_MOVBE_LOAD: case ISA_MOVBE_STORE: return CPU_SET_MOVBE;
     case ISA_LZCNT: return CPU_SET_LZCNT;
     case ISA_TZCNT: case ISA_ANDN: case ISA_BEXTR: case ISA_BLSI: case ISA_BLSMSK: case ISA_BLSR: return CPU_SET_BMI1;
+    case ISA_VPMOVSXBW: case ISA_VPMOVSXBD: case ISA_VPMOVSXBQ: case ISA_VPMOVSXWD:
+    case ISA_VPMOVSXWQ: case ISA_VPMOVSXDQ: case ISA_VPMOVZXBW: case ISA_VPMOVZXBD:
+    case ISA_VPMOVZXBQ: case ISA_VPMOVZXWD: case ISA_VPMOVZXWQ: case ISA_VPMOVZXDQ:
+    case ISA_AVX2_UNSUPPORTED: return CPU_SET_AVX2;
     default: return 0;
     }
 }
@@ -173,6 +184,30 @@ static void emit_rsp_mov(unsigned char **p, uint8_t opcode, int reg, uint8_t dis
 static void emit_mov_store(unsigned char **p, int reg, uint8_t disp) { emit_rsp_mov(p, 0x89, reg, disp); }
 static void emit_mov_load(unsigned char **p, int reg, uint8_t disp) { emit_rsp_mov(p, 0x8b, reg, disp); }
 
+/* VEX.256.F3.0F VMOVDQU: save/restore only vector registers referenced by this site.
+ * The emulator is compiled -mgeneral-regs-only, so other guest vector registers are untouched. */
+static void emit_ymm_rsp(unsigned char **p, int reg, int load, uint32_t displacement) {
+    emit_u8(p, 0xc4);
+    emit_u8(p, reg >= 8 ? 0x61 : 0xe1); /* inverted VEX.R, VEX.X/B, 0F map */
+    emit_u8(p, 0x7e);                   /* W=0, ~vvvv=1111, L=1, pp=F3 */
+    emit_u8(p, load ? 0x6f : 0x7f);    /* VMOVDQU ymm, m256 / m256, ymm */
+    emit_u8(p, (uint8_t)(0x84 | ((reg & 7) << 3)));
+    emit_u8(p, 0x24);                  /* SIB: [rsp + disp32] */
+    emit_u32(p, displacement);
+}
+
+static void emit_site_vectors(unsigned char **p, const IsaSite *s, int load) {
+    uint8_t regs[3] = {s->dst, s->src1, s->src2};
+    for (unsigned i = 0; i < 3; ++i) {
+        uint8_t reg = regs[i];
+        if (reg == ISA_NO_REG) continue;
+        if (reg >= 16) continue;
+        if ((i > 0 && reg == regs[0]) || (i > 1 && reg == regs[1])) continue;
+        uint32_t displacement = (uint32_t)(offsetof(IsaRegs, ymm) - sizeof(uint64_t) + (size_t)reg * 32);
+        emit_ymm_rsp(p, reg, load, displacement);
+    }
+}
+
 /* rel32 from the byte after a jmp ending at `next` to `target`; 0 when it does not fit. */
 static int rel32_to(const unsigned char *next, const unsigned char *target, int32_t *rel) {
     int64_t delta = (int64_t)((intptr_t)target - (intptr_t)next);
@@ -185,13 +220,14 @@ static int rel32_to(const unsigned char *next, const unsigned char *target, int3
  * jmp back is out of rel32 range. */
 static size_t emit_stub(unsigned char *code, const unsigned char *at, const IsaSite *s, uint64_t *hit,
                         unsigned char *image) {
-    static const uint8_t lea_rsp_down[] = {0x48, 0x8d, 0xa4, 0x24, 0x00, 0xff, 0xff, 0xff};   /* lea rsp,[rsp-0x100] */
-    static const uint8_t lea_rax_rsp_up[] = {0x48, 0x8d, 0x84, 0x24, 0x00, 0x01, 0x00, 0x00}; /* lea rax,[rsp+0x100] */
-    static const uint8_t lea_rsp_up[] = {0x48, 0x8d, 0xa4, 0x24, 0x00, 0x01, 0x00, 0x00};     /* lea rsp,[rsp+0x100] */
+    static const uint8_t lea_rsp_down[] = {0x48, 0x8d, 0xa4, 0x24, 0x00, 0xfd, 0xff, 0xff};   /* lea rsp,[rsp-0x300] */
+    static const uint8_t lea_rax_rsp_up[] = {0x48, 0x8d, 0x84, 0x24, 0x00, 0x03, 0x00, 0x00}; /* lea rax,[rsp+0x300] */
+    static const uint8_t lea_rsp_up[] = {0x48, 0x8d, 0xa4, 0x24, 0x00, 0x03, 0x00, 0x00};     /* lea rsp,[rsp+0x300] */
     unsigned char *p = code;
     emit_bytes(&p, lea_rsp_down, sizeof lea_rsp_down);
     for (int reg = 0; reg < 16; reg++)
         if (reg != 4) emit_mov_store(&p, reg, (uint8_t)(8 * reg));
+    if (vector_kind(s->kind)) emit_site_vectors(&p, s, 0);
     emit_bytes(&p, lea_rax_rsp_up, sizeof lea_rax_rsp_up);
     emit_mov_store(&p, 0, 8 * 4);                                   /* gpr[4] = guest rsp */
     emit_u8(&p, 0x9c);                                              /* pushfq: rsp = IsaRegs* */
@@ -207,7 +243,8 @@ static size_t emit_stub(unsigned char *code, const unsigned char *at, const IsaS
     emit_u64(&p, (uint64_t)(uintptr_t)isa_emulate);
     emit_bytes(&p, (const uint8_t[]){0xff, 0xd0}, 2);               /* call rax */
     emit_bytes(&p, (const uint8_t[]){0x48, 0x89, 0xec}, 3);         /* mov rsp, rbp */
-    emit_u8(&p, 0x9d);                                              /* popfq: rsp = &gpr[0] */
+    emit_u8(&p, 0x9d);                                              /* popfq: rsp = frame base */
+    if (vector_kind(s->kind)) emit_site_vectors(&p, s, 1);
     for (int reg = 0; reg < 16; reg++)
         if (reg != 4) emit_mov_load(&p, reg, (uint8_t)(8 * reg));
     emit_bytes(&p, lea_rsp_up, sizeof lea_rsp_up);
@@ -278,8 +315,8 @@ IsaReport isa_rewrite_apply(IsaTable *t, unsigned char *image, unsigned char *st
             continue;
         }
         if (size > ISA_STUB_BYTES) {
-            fprintf(stderr, "ISA: stub for site 0x%llx exceeds 256 bytes, site skipped\n",
-                    (unsigned long long)s->offset);
+            fprintf(stderr, "ISA: stub for site 0x%llx exceeds %u bytes, site skipped\n",
+                    (unsigned long long)s->offset, ISA_STUB_BYTES);
             report.skipped++;
             report.unsupported_needed++;
             continue;
@@ -319,8 +356,12 @@ int isa_rewrite_site_of_stub(const IsaTable *t, uintptr_t rip) {
 }
 
 const char *isa_kind_name(uint8_t kind) {
-    static const char *const names[] = {"?",     "movbe", "movbe",  "lzcnt", "tzcnt",     "andn",
-                                        "bextr", "blsi",  "blsmsk", "blsr",  "vcvtph2ps", "vcvtps2ph"};
+    static const char *const names[] = {
+        "?", "movbe", "movbe", "lzcnt", "tzcnt", "andn", "bextr", "blsi", "blsmsk", "blsr",
+        "vpmovsxbw", "vpmovsxbd", "vpmovsxbq", "vpmovsxwd", "vpmovsxwq", "vpmovsxdq",
+        "vpmovzxbw", "vpmovzxbd", "vpmovzxbq", "vpmovzxwd", "vpmovzxwq", "vpmovzxdq",
+        "avx2-unsupported"
+    };
     return kind < sizeof names / sizeof names[0] ? names[kind] : "?";
 }
 
