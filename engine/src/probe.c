@@ -47,6 +47,7 @@ static uint64_t module_count;
 static int entered_game;
 static int gpu_enabled;
 static unsigned isa_missing_sets;
+static int isa_diagnostic;
 static IsaTable *isa_table;
 static unsigned char *isa_stubs;
 static size_t isa_stubs_size;
@@ -174,6 +175,12 @@ static void fault(int sig, siginfo_t *info, void *context) {
     }
     ucontext_t *uc = context;
     uintptr_t rip = (uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
+    if (sig == SIGILL && isa_diagnostic && isa_table) {
+        char diagnostic[512];
+        int length = isa_rewrite_describe_fault(isa_table, rip, diagnostic, sizeof(diagnostic));
+        if (length > 0) { ssize_t written_ = write(2, diagnostic, (size_t)length); (void)written_; }
+        _exit(128 + sig);
+    }
     if (sig == SIGTRAP && isa_table && rip) {
         IsaRegs regs = {0};
         greg_t *g = uc->uc_mcontext.gregs;
@@ -622,6 +629,19 @@ static LONG CALLBACK vectored_handler(EXCEPTION_POINTERS *e) {
             return EXCEPTION_CONTINUE_EXECUTION;
         }
     }
+    if (r->ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION && isa_diagnostic &&
+        guest_address((uintptr_t)e->ContextRecord->Rip)) {
+        char diagnostic[512];
+        int length = isa_rewrite_describe_fault(isa_table, (uintptr_t)e->ContextRecord->Rip,
+                                                diagnostic, sizeof(diagnostic));
+        if (length > 0) fwrite(diagnostic, 1, (size_t)length, stderr);
+        else fputs("ISA diagnostic: host CPU raised #UD while executing guest code; no scanner record matched.\\n", stderr);
+        fputs("ISA diagnostic: stopping deliberately at the first unsupported instruction.\\n", stderr);
+        fflush(stderr);
+        report_exception(e);
+        write_crash_dump(e);
+        terminate((unsigned)EXCEPTION_ILLEGAL_INSTRUCTION);
+    }
     if (!fatal(r->ExceptionCode)) return EXCEPTION_CONTINUE_SEARCH;
     if (!guest_address((uintptr_t)e->ContextRecord->Rip) && !host_fault_dead_end(e->ContextRecord)) {
         note_host_fault(e);
@@ -849,6 +869,11 @@ int main(int argc, char **argv) {
 #endif
     if (argc == 2 && !strcmp(argv[1], "--vulkan-only")) return vulkan_smoke();
     check_cpu();
+    const char *isa_diagnostic_env = getenv("BB_ISA_DIAGNOSTIC");
+    isa_diagnostic = isa_diagnostic_env && !strcmp(isa_diagnostic_env, "1") &&
+                     (isa_missing_sets & CPU_SET_AVX2) != 0;
+    if (isa_diagnostic)
+        puts("ISA diagnostic: unimplemented AVX2 candidates will be left untouched; the first executed one will stop the process with a #UD report");
     int cpu_only = 0, strict_imports = 0;
     unsigned timeout_seconds = 10;
     const char *content_profile=NULL, *app0=NULL, *user_dir=NULL, *patch_file=NULL;
@@ -1086,9 +1111,12 @@ int main(int argc, char **argv) {
     if (isa_table) {
         isa_stubs_size = round_page(isa_stub_area_size(isa_table));
         if (isa_stubs_size) isa_stubs = allocate(isa_stubs_size);
-        IsaReport report = isa_rewrite_apply(isa_table, image, isa_stubs, isa_missing_sets);
+        IsaReport report = isa_rewrite_apply(isa_table, image, isa_stubs, isa_missing_sets, isa_diagnostic);
         if (report.unsupported_needed)
             fail("the linked image contains MOVBE/BMI1/LZCNT/AVX2 encodings that this compatibility layer cannot rewrite");
+        if (report.diagnostic_avx2)
+            printf("ISA diagnostic: %u unsupported AVX2 candidates left untouched for runtime validation\\n",
+                   report.diagnostic_avx2);
         if (isa_stubs && isa_stubs_size) protect(isa_stubs, isa_stubs_size, 5);
         printf("ISA: rewrote %u sites (%u jmp, %u relocated, %u int3); %u changed sites skipped\n",
                report.rewritten, report.jmp, report.relocated, report.int3, report.skipped);
