@@ -152,10 +152,16 @@ fn checked_skip(data: &[u8], at: &mut usize, count: u64, width: u64) -> Result<(
 // bindings are strong roots. Image-relative relocations into executable memory are only
 // candidate function pointers: they can also describe addresses of internal code/data labels.
 #[derive(Default)]
+struct RelocationRoot {
+    address: u64,
+    target: u64,
+}
+
+#[derive(Default)]
 struct ScanRoots {
     entry_and_init: Vec<u64>,
     function_bindings: Vec<u64>,
-    relocation_candidates: Vec<u64>,
+    relocation_candidates: Vec<RelocationRoot>,
 }
 
 struct LinkedImage {
@@ -243,14 +249,14 @@ fn read_boot_linked(data: &[u8]) -> Result<LinkedImage, String> {
     checked_skip(data, &mut at, import_count, 128)?;
 
     for _ in 0..reloc_count {
-        let _target = take_u64(data, &mut at)?;
+        let target = take_u64(data, &mut at)?;
         let kind = take_u64(data, &mut at)?;
         let value = take_u64(data, &mut at)?;
         let _addend = take_u64(data, &mut at)?;
         // kind 0 is an image-relative relocation. It may be a static function pointer;
         // kinds 1 and 2 are imports/TLS and do not contain a local image code address.
         if kind == 0 {
-            roots.relocation_candidates.push(value);
+            roots.relocation_candidates.push(RelocationRoot { address: value, target });
         }
     }
 
@@ -262,7 +268,9 @@ fn read_boot_linked(data: &[u8]) -> Result<LinkedImage, String> {
 
     normalize_roots(&mut roots.entry_and_init, &segments);
     normalize_roots(&mut roots.function_bindings, &segments);
-    normalize_roots(&mut roots.relocation_candidates, &segments);
+    roots.relocation_candidates.retain(|root| executable_address(root.address, &segments));
+    roots.relocation_candidates.sort_by_key(|root| (root.address, root.target));
+    roots.relocation_candidates.dedup_by_key(|root| (root.address, root.target));
 
     Ok(LinkedImage { segments, image: data[at..end].to_vec(), roots })
 }
@@ -439,16 +447,29 @@ fn scan_segment(code: &[u8], address: u64) -> Vec<Site> {
     sites
 }
 
+// One CFG-reached instruction together with the root and predecessor that first reached it.
+// This provenance lets the diagnostic identify which relocation candidate introduced a path.
+struct ReachableSite {
+    site: Site,
+    root: u64,
+    predecessor: Option<u64>,
+}
+
 // Recursive-descent control-flow scan used as a second opinion on the linear sweep.
 // This is deliberately diagnostic for now: indirect branches and dynamically constructed
 // function pointers can hide edges, so a site not reached from these roots is NOT yet proven
 // to be data and must not be silently removed from the fail-closed rewrite table.
-fn scan_reachable(segments: &[Segment], image: &[u8], roots: &[u64]) -> Vec<Site> {
-    let mut queue: VecDeque<u64> = roots.iter().copied().collect();
+fn scan_reachable_traced(
+    segments: &[Segment],
+    image: &[u8],
+    roots: &[u64],
+) -> Vec<ReachableSite> {
+    let mut queue: VecDeque<(u64, u64, Option<u64>)> =
+        roots.iter().map(|&root| (root, root, None)).collect();
     let mut decoded = HashSet::new();
-    let mut sites: HashMap<u64, Site> = HashMap::new();
+    let mut sites: HashMap<u64, ReachableSite> = HashMap::new();
 
-    while let Some(start) = queue.pop_front() {
+    while let Some((start, root, initial_predecessor)) = queue.pop_front() {
         let Some(segment) = segments.iter().find(|s| {
             s.flags & 1 != 0 && start >= s.address && start - s.address < s.size
         }) else {
@@ -463,6 +484,7 @@ fn scan_reachable(segments: &[Segment], image: &[u8], roots: &[u64]) -> Vec<Site
         let Ok(mut decoder) = Decoder::try_with_ip(64, code, start, DecoderOptions::NONE) else {
             continue;
         };
+        let mut predecessor = initial_predecessor;
 
         while decoder.can_decode() {
             let byte_start = decoder.position();
@@ -475,7 +497,11 @@ fn scan_reachable(segments: &[Segment], image: &[u8], roots: &[u64]) -> Vec<Site
             }
             let bytes = code.get(byte_start..decoder.position()).unwrap_or_default();
             if let Some(kind) = kind_of(&ins) {
-                sites.entry(ins.ip()).or_insert_with(|| site_of(&ins, kind, bytes));
+                sites.entry(ins.ip()).or_insert_with(|| ReachableSite {
+                    site: site_of(&ins, kind, bytes),
+                    root,
+                    predecessor,
+                });
             }
 
             let direct_target = (ins.op0_kind() == OpKind::NearBranch64)
@@ -485,7 +511,7 @@ fn scan_reachable(segments: &[Segment], image: &[u8], roots: &[u64]) -> Vec<Site
                 FlowControl::Call | FlowControl::IndirectCall => {
                     if let Some(target) = direct_target {
                         if executable_address(target, segments) {
-                            queue.push_back(target);
+                            queue.push_back((target, root, Some(ins.ip())));
                         }
                     }
                     // A call returns to the next instruction. Indirect call targets are
@@ -494,14 +520,14 @@ fn scan_reachable(segments: &[Segment], image: &[u8], roots: &[u64]) -> Vec<Site
                 FlowControl::ConditionalBranch => {
                     if let Some(target) = direct_target {
                         if executable_address(target, segments) {
-                            queue.push_back(target);
+                            queue.push_back((target, root, Some(ins.ip())));
                         }
                     }
                 }
                 FlowControl::UnconditionalBranch => {
                     if let Some(target) = direct_target {
                         if executable_address(target, segments) {
-                            queue.push_back(target);
+                            queue.push_back((target, root, Some(ins.ip())));
                         }
                     }
                     break;
@@ -509,19 +535,27 @@ fn scan_reachable(segments: &[Segment], image: &[u8], roots: &[u64]) -> Vec<Site
                 FlowControl::XbeginXabortXend => {
                     if let Some(target) = direct_target {
                         if executable_address(target, segments) {
-                            queue.push_back(target);
+                            queue.push_back((target, root, Some(ins.ip())));
                         }
                     }
                 }
                 FlowControl::IndirectBranch | FlowControl::Return |
                 FlowControl::Interrupt | FlowControl::Exception => break,
             }
+            predecessor = Some(ins.ip());
         }
     }
 
-    let mut result: Vec<Site> = sites.into_values().collect();
-    result.sort_by_key(|site| site.offset);
+    let mut result: Vec<ReachableSite> = sites.into_values().collect();
+    result.sort_by_key(|entry| entry.site.offset);
     result
+}
+
+fn scan_reachable(segments: &[Segment], image: &[u8], roots: &[u64]) -> Vec<Site> {
+    scan_reachable_traced(segments, image, roots)
+        .into_iter()
+        .map(|entry| entry.site)
+        .collect()
 }
 
 fn padded(bytes: &[u8]) -> [u8; MAX_INSTRUCTION] {
@@ -617,33 +651,54 @@ fn scan(boot: &Path, out: &Path) -> Result<String, String> {
 
     let strong_reachable = scan_reachable(&linked.segments, &linked.image, &strong_roots);
     let mut all_roots = strong_roots.clone();
-    all_roots.extend(linked.roots.relocation_candidates.iter().copied());
+    all_roots.extend(linked.roots.relocation_candidates.iter().map(|root| root.address));
     normalize_roots(&mut all_roots, &linked.segments);
-    let all_reachable = scan_reachable(&linked.segments, &linked.image, &all_roots);
+    let all_reachable = scan_reachable_traced(&linked.segments, &linked.image, &all_roots);
 
     let strong_avx2 = strong_reachable.iter().filter(|site| site.kind.set() == "AVX2").count();
     let strong_unsupported = strong_reachable.iter()
         .filter(|site| site.kind.set() == "AVX2" && site.mode == Mode::Unsupported).count();
-    let all_avx2 = all_reachable.iter().filter(|site| site.kind.set() == "AVX2").count();
+    let all_avx2 = all_reachable.iter().filter(|entry| entry.site.kind.set() == "AVX2").count();
     let all_unsupported = all_reachable.iter()
-        .filter(|site| site.kind.set() == "AVX2" && site.mode == Mode::Unsupported).count();
-    let all_offsets: HashSet<u64> = all_reachable.iter().map(|site| site.offset).collect();
-    let strong_offsets: HashSet<u64> = strong_reachable.iter().map(|site| site.offset).collect();
+        .filter(|entry| entry.site.kind.set() == "AVX2" && entry.site.mode == Mode::Unsupported).count();
+    let all_offsets: HashSet<u64> = all_reachable.iter().map(|entry| entry.site.offset).collect();
     let linear_only_unsupported = sites.iter()
         .filter(|site| site.kind.set() == "AVX2" && site.mode == Mode::Unsupported &&
                        !all_offsets.contains(&site.offset)).count();
     let weak_roots = all_roots.len().saturating_sub(strong_roots.len());
     let cfg_unsupported: Vec<String> = all_reachable.iter()
-        .filter(|site| site.kind.set() == "AVX2" && site.mode == Mode::Unsupported)
+        .filter(|entry| entry.site.kind.set() == "AVX2" &&
+                        entry.site.mode == Mode::Unsupported)
         .take(16)
-        .map(|site| {
+        .map(|entry| {
+            let site = &entry.site;
             let length = usize::from(site.length).min(site.original.len());
             let bytes = site.original[..length].iter()
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<Vec<_>>()
                 .join(" ");
-            let provenance = if strong_offsets.contains(&site.offset) { "strong" } else { "relocation" };
-            format!("ISA CFG: {provenance}-reachable unsupported AVX2 at +0x{:x} bytes: {bytes}", site.offset)
+            let provenance = if strong_roots.binary_search(&entry.root).is_ok() {
+                "strong"
+            } else {
+                "relocation"
+            };
+            let relocation_slots: Vec<String> = linked.roots.relocation_candidates.iter()
+                .filter(|root| root.address == entry.root)
+                .take(4)
+                .map(|root| format!("+0x{:x}", root.target))
+                .collect();
+            let source = if relocation_slots.is_empty() {
+                String::new()
+            } else {
+                format!(" (relocation slot(s): {})", relocation_slots.join(", "))
+            };
+            let predecessor = entry.predecessor
+                .map(|address| format!(" via +0x{address:x}"))
+                .unwrap_or_default();
+            format!(
+                "ISA CFG: {provenance} root +0x{:x}{source}{predecessor} reaches unsupported AVX2 at +0x{:x} bytes: {bytes}",
+                entry.root, site.offset
+            )
         })
         .collect();
     let cfg_detail = if cfg_unsupported.is_empty() {
