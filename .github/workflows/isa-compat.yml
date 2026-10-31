@@ -59,8 +59,13 @@ jobs:
       - name: Differentially test instruction semantics
         run: |
           clang -std=gnu11 -O2 -Wall -Wextra -Werror -mgeneral-regs-only -Iengine/src \
-            engine/src/isa_emulate.c engine/tests/test_isa_emulate.c \
-            -o "$RUNNER_TEMP/test-isa-emulate"
+            -c engine/src/isa_emulate.c -o "$RUNNER_TEMP/isa_emulate-test.o"
+          clang -std=gnu11 -O2 -Wall -Wextra -Werror -Iengine/src \
+            -c engine/src/isa_rewrite.c -o "$RUNNER_TEMP/isa_rewrite-test.o"
+          clang -std=gnu11 -O2 -Wall -Wextra -Werror -mgeneral-regs-only -Iengine/src \
+            -c engine/tests/test_isa_emulate.c -o "$RUNNER_TEMP/test_isa_emulate.o"
+          clang "$RUNNER_TEMP/isa_emulate-test.o" "$RUNNER_TEMP/isa_rewrite-test.o" \
+            "$RUNNER_TEMP/test_isa_emulate.o" -o "$RUNNER_TEMP/test-isa-emulate"
           "$RUNNER_TEMP/test-isa-emulate"
 
   windows-scanner:
