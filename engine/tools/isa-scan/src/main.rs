@@ -259,12 +259,14 @@ fn site_of(ins: &Instruction, kind: Kind, bytes: &[u8]) -> Site {
     for operand in 0..ins.op_count() {
         match ins.op_kind(operand) {
             OpKind::Register => {
-                let register = ins.op_register(operand);
-                if let Some(slot) = registers.get_mut(operand as usize) {
-                    *slot = site_register_number(kind, register);
-                }
-                if width == 0 {
-                    width = if kind.is_vector_conversion() { register.size() } else { register.size() * 8 };
+                if kind != Kind::Avx2Unsupported {
+                    let register = ins.op_register(operand);
+                    if let Some(slot) = registers.get_mut(operand as usize) {
+                        *slot = site_register_number(kind, register);
+                    }
+                    if width == 0 {
+                        width = if kind.is_vector_conversion() { register.size() } else { register.size() * 8 };
+                    }
                 }
             }
             OpKind::Memory => mem_slot = if operand == 0 { 1 } else { 2 },
