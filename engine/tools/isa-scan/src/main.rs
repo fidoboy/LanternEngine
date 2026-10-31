@@ -649,7 +649,7 @@ fn scan(boot: &Path, out: &Path) -> Result<String, String> {
     let cfg_detail = if cfg_unsupported.is_empty() {
         String::new()
     } else {
-        format!("\\n{}", cfg_unsupported.join("\\n"))
+        format!("\n{}", cfg_unsupported.join("\n"))
     };
 
     let table = encode_table(&linked.image, &sites)?;
