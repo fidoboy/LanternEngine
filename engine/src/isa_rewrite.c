@@ -335,7 +335,7 @@ IsaReport isa_rewrite_apply(IsaTable *t, unsigned char *image, unsigned char *st
         int32_t rel;
         size_t size;
         if (!rel32_to(site + JMP_BYTES, stub, &rel) ||
-            (size = emit_stub(code, stub, s, &t->hits[i], image, t->count_hits)) == 0) {
+            (size = emit_stub(code, stub, s, &t->hits[i], image, t->count_hits && vector_kind(s->kind))) == 0) {
             fprintf(stderr, "ISA: site 0x%llx out of rel32 range\n", (unsigned long long)s->offset);
             report.skipped++;
             report.unsupported_needed++;
@@ -415,7 +415,7 @@ int isa_rewrite_trap(IsaTable *t, uintptr_t address, IsaRegs *regs, uintptr_t *n
     if (lo == t->count || t->sites[lo].offset != offset) return 0;
     if (t->sites[lo].mode != ISA_MODE_INT3 || *(const unsigned char *)address != 0xcc) return 0;
     isa_emulate(&t->sites[lo], regs);
-    if (t->count_hits)
+    if (t->count_hits && vector_kind(t->sites[lo].kind))
         __atomic_fetch_add(&t->hits[lo], 1, __ATOMIC_RELAXED);
     else
         t->hits[lo]++;
@@ -462,7 +462,9 @@ void isa_rewrite_report(const IsaTable *t, FILE *out) {
 
 
 static uint64_t isa_site_hits(const IsaTable *t, uint32_t index) {
-    return t->count_hits ? __atomic_load_n(&t->hits[index], __ATOMIC_RELAXED) : t->hits[index];
+    return t->count_hits && vector_kind(t->sites[index].kind)
+               ? __atomic_load_n(&t->hits[index], __ATOMIC_RELAXED)
+               : t->hits[index];
 }
 
 void isa_rewrite_report_avx2(const IsaTable *t, FILE *out) {

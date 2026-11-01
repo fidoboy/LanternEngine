@@ -26,7 +26,7 @@ IsaTable *isa_table_load(const char *path);
 int isa_table_matches(const IsaTable *t, const unsigned char *image, uint64_t size);
 size_t isa_stub_area_size(const IsaTable *t);           /* count * ISA_STUB_BYTES */
 unsigned isa_site_set(const IsaSite *s);                 /* CPU_SET_* of the kind */
-/* Enable low-overhead hit counting; atomic increments are emitted only when enabled. */
+/* Enable atomic hit counting for AVX2 conversion sites only; off by default. */
 void isa_rewrite_set_counting(IsaTable *t, int enabled);
 /* Rewrites the sites whose set is in `sets` (spec 5.4). Writes nothing and returns
  * unsupported_needed > 0 when a needed site is UNSUPPORTED. `stubs` has isa_stub_area_size bytes, RW.
