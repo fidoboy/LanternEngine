@@ -459,3 +459,56 @@ void isa_rewrite_report(const IsaTable *t, FILE *out) {
         prev = best;
     }
 }
+
+
+static uint64_t isa_site_hits(const IsaTable *t, uint32_t index) {
+    return t->count_hits ? __atomic_load_n(&t->hits[index], __ATOMIC_RELAXED) : t->hits[index];
+}
+
+void isa_rewrite_report_avx2(const IsaTable *t, FILE *out) {
+    if (!out) return;
+    fputs("ISA AVX2 emulation counters (VPMOVSX/VPMOVZX):\n", out);
+    if (!t) {
+        fputs("  ISA rewrite table unavailable.\n", out);
+        return;
+    }
+
+    enum { AVX2_KIND_COUNT = ISA_VPMOVZXDQ - ISA_VPMOVSXBW + 1 };
+    uint64_t totals[AVX2_KIND_COUNT] = {0};
+    uint64_t total_hits = 0;
+    uint32_t recognized_sites = 0, executed_sites = 0;
+
+    for (uint32_t i = 0; i < t->count; ++i) {
+        const IsaSite *site = &t->sites[i];
+        if (!vector_kind(site->kind)) continue;
+        ++recognized_sites;
+        const uint64_t hits = isa_site_hits(t, i);
+        totals[site->kind - ISA_VPMOVSXBW] += hits;
+        total_hits += hits;
+        if (hits) ++executed_sites;
+    }
+
+    fprintf(out, "  recognized sites: %u; executed sites: %u; total emulations: %llu\n",
+            recognized_sites, executed_sites, (unsigned long long)total_hits);
+    if (!total_hits) {
+        fputs("  No emulated AVX2 conversion instructions were executed.\n", out);
+        return;
+    }
+
+    fputs("  totals by instruction:\n", out);
+    for (unsigned i = 0; i < AVX2_KIND_COUNT; ++i) {
+        if (!totals[i]) continue;
+        const uint8_t kind = (uint8_t)(ISA_VPMOVSXBW + i);
+        fprintf(out, "    %-10s %llu\n", isa_kind_name(kind), (unsigned long long)totals[i]);
+    }
+
+    fputs("  executed sites (guest image offsets):\n", out);
+    for (uint32_t i = 0; i < t->count; ++i) {
+        const IsaSite *site = &t->sites[i];
+        if (!vector_kind(site->kind)) continue;
+        const uint64_t hits = isa_site_hits(t, i);
+        if (!hits) continue;
+        fprintf(out, "    +0x%llx %-10s %llu\n", (unsigned long long)site->offset,
+                isa_kind_name(site->kind), (unsigned long long)hits);
+    }
+}
