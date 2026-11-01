@@ -150,6 +150,10 @@ int isa_table_matches(const IsaTable *t, const unsigned char *image, uint64_t si
 
 size_t isa_stub_area_size(const IsaTable *t) { return (size_t)t->count * ISA_STUB_BYTES; }
 
+void isa_rewrite_set_counting(IsaTable *t, int enabled) {
+    if (t) t->count_hits = enabled != 0;
+}
+
 unsigned isa_site_set(const IsaSite *s) {
     switch (s->kind) {
     case ISA_MOVBE_LOAD: case ISA_MOVBE_STORE: return CPU_SET_MOVBE;
@@ -219,7 +223,7 @@ static int rel32_to(const unsigned char *next, const unsigned char *target, int3
 /* Writes the stub for `s` into `code` (laid out to run at `at`). Returns its size, or 0 when the
  * jmp back is out of rel32 range. */
 static size_t emit_stub(unsigned char *code, const unsigned char *at, const IsaSite *s, uint64_t *hit,
-                        unsigned char *image) {
+                        unsigned char *image, int count_hits) {
     static const uint8_t lea_rsp_down[] = {0x48, 0x8d, 0xa4, 0x24, 0x00, 0xfd, 0xff, 0xff};   /* lea rsp,[rsp-0x300] */
     static const uint8_t lea_rax_rsp_up[] = {0x48, 0x8d, 0x84, 0x24, 0x00, 0x03, 0x00, 0x00}; /* lea rax,[rsp+0x300] */
     static const uint8_t lea_rsp_up[] = {0x48, 0x8d, 0xa4, 0x24, 0x00, 0x03, 0x00, 0x00};     /* lea rsp,[rsp+0x300] */
@@ -233,7 +237,10 @@ static size_t emit_stub(unsigned char *code, const unsigned char *at, const IsaS
     emit_u8(&p, 0x9c);                                              /* pushfq: rsp = IsaRegs* */
     emit_bytes(&p, (const uint8_t[]){0x48, 0xb8}, 2);               /* mov rax, &hits[i] */
     emit_u64(&p, (uint64_t)(uintptr_t)hit);
-    emit_bytes(&p, (const uint8_t[]){0x48, 0xff, 0x00}, 3);         /* inc qword [rax] */
+    if (count_hits)
+        emit_bytes(&p, (const uint8_t[]){0xf0, 0x48, 0xff, 0x00}, 4); /* lock inc qword [rax] */
+    else
+        emit_bytes(&p, (const uint8_t[]){0x48, 0xff, 0x00}, 3);       /* inc qword [rax] */
     emit_bytes(&p, (const uint8_t[]){0x48, 0x89, 0xe5}, 3);         /* mov rbp, rsp */
     emit_bytes(&p, (const uint8_t[]){0x48, 0x83, 0xe4, 0xf0}, 4);   /* and rsp, -16 */
     emit_bytes(&p, (const uint8_t[]){0x48, 0xbf}, 2);               /* mov rdi, site */
@@ -327,7 +334,8 @@ IsaReport isa_rewrite_apply(IsaTable *t, unsigned char *image, unsigned char *st
         unsigned char code[2 * ISA_STUB_BYTES];
         int32_t rel;
         size_t size;
-        if (!rel32_to(site + JMP_BYTES, stub, &rel) || (size = emit_stub(code, stub, s, &t->hits[i], image)) == 0) {
+        if (!rel32_to(site + JMP_BYTES, stub, &rel) ||
+            (size = emit_stub(code, stub, s, &t->hits[i], image, t->count_hits)) == 0) {
             fprintf(stderr, "ISA: site 0x%llx out of rel32 range\n", (unsigned long long)s->offset);
             report.skipped++;
             report.unsupported_needed++;
@@ -407,7 +415,10 @@ int isa_rewrite_trap(IsaTable *t, uintptr_t address, IsaRegs *regs, uintptr_t *n
     if (lo == t->count || t->sites[lo].offset != offset) return 0;
     if (t->sites[lo].mode != ISA_MODE_INT3 || *(const unsigned char *)address != 0xcc) return 0;
     isa_emulate(&t->sites[lo], regs);
-    t->hits[lo]++;
+    if (t->count_hits)
+        __atomic_fetch_add(&t->hits[lo], 1, __ATOMIC_RELAXED);
+    else
+        t->hits[lo]++;
     *next_rip = address + t->sites[lo].length;
     return 1;
 }

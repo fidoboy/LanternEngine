@@ -14,6 +14,7 @@ typedef struct {
     uint32_t count, unsupported;
     uint64_t image_size; uint8_t sha256[32];
     unsigned char *image, *stubs;        /* set by isa_rewrite_apply */
+    uint8_t count_hits;                   /* use atomic hit counters for diagnostic reports */
 } IsaTable;
 /* rewritten = jmp + relocated + int3; skipped and unsupported_needed are outside it. */
 typedef struct { uint32_t rewritten, jmp, relocated, int3, skipped, unsupported_needed, diagnostic_avx2; } IsaReport;
@@ -25,6 +26,8 @@ IsaTable *isa_table_load(const char *path);
 int isa_table_matches(const IsaTable *t, const unsigned char *image, uint64_t size);
 size_t isa_stub_area_size(const IsaTable *t);           /* count * ISA_STUB_BYTES */
 unsigned isa_site_set(const IsaSite *s);                 /* CPU_SET_* of the kind */
+/* Enable low-overhead hit counting; atomic increments are emitted only when enabled. */
+void isa_rewrite_set_counting(IsaTable *t, int enabled);
 /* Rewrites the sites whose set is in `sets` (spec 5.4). Writes nothing and returns
  * unsupported_needed > 0 when a needed site is UNSUPPORTED. `stubs` has isa_stub_area_size bytes, RW.
  * diagnostic_avx2 permits only ISA_AVX2_UNSUPPORTED records to remain untouched; this is
@@ -45,6 +48,8 @@ int isa_rewrite_site_of_stub(const IsaTable *t, uintptr_t rip);
 /* "ISA: most executed sites:" then up to 10 lines "  0x<offset> <mnemonic> <hits>" (hits > 0 only),
  * descending hits, ties by ascending offset. */
 void isa_rewrite_report(const IsaTable *t, FILE *out);
+/* Report execution counts for the AVX2 conversion instructions emulated by this compatibility layer. */
+void isa_rewrite_report_avx2(const IsaTable *t, FILE *out);
 /* Instruction mnemonic for the kind, including AVX2 conversions and the unsupported sentinel. */
 const char *isa_kind_name(uint8_t kind);
 

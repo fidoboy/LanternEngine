@@ -48,10 +48,17 @@ static int entered_game;
 static int gpu_enabled;
 static unsigned isa_missing_sets;
 static int isa_diagnostic;
+static int isa_report_avx2;
 static IsaTable *isa_table;
 static unsigned char *isa_stubs;
 static size_t isa_stubs_size;
 int vulkan_smoke(void);
+
+void bb_isa_report_on_exit(void) {
+    if (!isa_report_avx2 || !isa_table) return;
+    isa_rewrite_report_avx2(isa_table, stdout);
+    fflush(stdout);
+}
 
 static __attribute__((noreturn)) void fail(const char *message) { fprintf(stderr, "ERROR: %s\n", message); exit(1); }
 
@@ -877,6 +884,11 @@ int main(int argc, char **argv) {
                      (isa_missing_sets & CPU_SET_AVX2) != 0;
     if (isa_diagnostic)
         puts("ISA diagnostic: unimplemented AVX2 candidates will be left untouched; the first executed one will stop the process with a #UD report");
+    const char *isa_report_env = getenv("BB_ISA_REPORT");
+    isa_report_avx2 = isa_report_env && !strcmp(isa_report_env, "1") &&
+                      (isa_missing_sets & CPU_SET_AVX2) != 0;
+    if (isa_report_avx2)
+        puts("ISA report: atomic AVX2 emulation hit counters enabled for this session");
     int cpu_only = 0, strict_imports = 0;
     unsigned timeout_seconds = 10;
     const char *content_profile=NULL, *app0=NULL, *user_dir=NULL, *patch_file=NULL;
@@ -1048,6 +1060,7 @@ int main(int argc, char **argv) {
         if (!isa_table) fail("CPU needs MOVBE/BMI1/LZCNT emulation but the ISA rewrite table is unavailable");
         if (isa_table_matches(isa_table, image, size))
             fail("ISA rewrite table does not match the linked boot image");
+        if (isa_report_avx2) isa_rewrite_set_counting(isa_table, 1);
     }
     if (!cpu_only) {
         char title[128]="Bloodborne", serial[16]="UNKNOWN", sfo[4096];
