@@ -47,10 +47,18 @@ static uint64_t module_count;
 static int entered_game;
 static int gpu_enabled;
 static unsigned isa_missing_sets;
+static int isa_diagnostic;
+static int isa_report_avx2;
 static IsaTable *isa_table;
 static unsigned char *isa_stubs;
 static size_t isa_stubs_size;
 int vulkan_smoke(void);
+
+void bb_isa_report_on_exit(void) {
+    if (!isa_report_avx2 || !isa_table) return;
+    isa_rewrite_report_avx2(isa_table, stdout);
+    fflush(stdout);
+}
 
 static __attribute__((noreturn)) void fail(const char *message) { fprintf(stderr, "ERROR: %s\n", message); exit(1); }
 
@@ -90,15 +98,17 @@ static void check_cpu(void) {
     if (!(leaf1_c & bit_MOVBE)) isa_missing_sets |= CPU_SET_MOVBE;
     if (!(leaf7_b & bit_BMI)) isa_missing_sets |= CPU_SET_BMI1;
     if (!(ext1_c & bit_LZCNT)) isa_missing_sets |= CPU_SET_LZCNT;
+    if (!(leaf7_b & (1u << 5))) isa_missing_sets |= CPU_SET_AVX2;
 
     if (isa_missing_sets) {
         char absent[32] = "";
         if (isa_missing_sets & CPU_SET_MOVBE) strcat(absent, "MOVBE");
         if (isa_missing_sets & CPU_SET_BMI1) strcat(absent, absent[0] ? ", BMI1" : "BMI1");
         if (isa_missing_sets & CPU_SET_LZCNT) strcat(absent, absent[0] ? ", LZCNT" : "LZCNT");
+        if (isa_missing_sets & CPU_SET_AVX2) strcat(absent, absent[0] ? ", AVX2" : "AVX2");
         printf("CPU: missing %s; enabling instruction compatibility rewriting\n", absent);
     } else {
-        puts("CPU: native MOVBE, BMI1 and LZCNT; instruction rewriting disabled");
+        puts("CPU: native MOVBE, BMI1, LZCNT and AVX2; instruction rewriting disabled");
     }
 }
 static uint64_t read64(FILE *f) {
@@ -172,6 +182,15 @@ static void fault(int sig, siginfo_t *info, void *context) {
     }
     ucontext_t *uc = context;
     uintptr_t rip = (uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
+    if (sig == SIGILL && isa_diagnostic && isa_table) {
+        char diagnostic[512];
+        int length = isa_rewrite_describe_fault(isa_table, rip, diagnostic, sizeof(diagnostic));
+        if (length > 0) {
+            ssize_t written_ = write(2, diagnostic, (size_t)length);
+            (void)written_;
+            _exit(128 + sig);
+        }
+    }
     if (sig == SIGTRAP && isa_table && rip) {
         IsaRegs regs = {0};
         greg_t *g = uc->uc_mcontext.gregs;
@@ -620,6 +639,19 @@ static LONG CALLBACK vectored_handler(EXCEPTION_POINTERS *e) {
             return EXCEPTION_CONTINUE_EXECUTION;
         }
     }
+    if (r->ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION && isa_diagnostic &&
+        guest_address((uintptr_t)e->ContextRecord->Rip)) {
+        char diagnostic[512];
+        int length = isa_rewrite_describe_fault(isa_table, (uintptr_t)e->ContextRecord->Rip,
+                                                diagnostic, sizeof(diagnostic));
+        if (length > 0) fwrite(diagnostic, 1, (size_t)length, stderr);
+        else fputs("ISA diagnostic: host CPU raised #UD while executing guest code; no scanner record matched.\n", stderr);
+        fputs("ISA diagnostic: stopping deliberately at the first unsupported instruction.\n", stderr);
+        fflush(stderr);
+        report_exception(e);
+        write_crash_dump(e);
+        terminate((unsigned)EXCEPTION_ILLEGAL_INSTRUCTION);
+    }
     if (!fatal(r->ExceptionCode)) return EXCEPTION_CONTINUE_SEARCH;
     if (!guest_address((uintptr_t)e->ContextRecord->Rip) && !host_fault_dead_end(e->ContextRecord)) {
         note_host_fault(e);
@@ -847,6 +879,16 @@ int main(int argc, char **argv) {
 #endif
     if (argc == 2 && !strcmp(argv[1], "--vulkan-only")) return vulkan_smoke();
     check_cpu();
+    const char *isa_diagnostic_env = getenv("BB_ISA_DIAGNOSTIC");
+    isa_diagnostic = isa_diagnostic_env && !strcmp(isa_diagnostic_env, "1") &&
+                     (isa_missing_sets & CPU_SET_AVX2) != 0;
+    if (isa_diagnostic)
+        puts("ISA diagnostic: unimplemented AVX2 candidates will be left untouched; the first executed one will stop the process with a #UD report");
+    const char *isa_report_env = getenv("BB_ISA_REPORT");
+    isa_report_avx2 = isa_report_env && !strcmp(isa_report_env, "1") &&
+                      (isa_missing_sets & CPU_SET_AVX2) != 0;
+    if (isa_report_avx2)
+        puts("ISA report: atomic AVX2 emulation hit counters enabled for this session");
     int cpu_only = 0, strict_imports = 0;
     unsigned timeout_seconds = 10;
     const char *content_profile=NULL, *app0=NULL, *user_dir=NULL, *patch_file=NULL;
@@ -1018,6 +1060,7 @@ int main(int argc, char **argv) {
         if (!isa_table) fail("CPU needs MOVBE/BMI1/LZCNT emulation but the ISA rewrite table is unavailable");
         if (isa_table_matches(isa_table, image, size))
             fail("ISA rewrite table does not match the linked boot image");
+        if (isa_report_avx2) isa_rewrite_set_counting(isa_table, 1);
     }
     if (!cpu_only) {
         char title[128]="Bloodborne", serial[16]="UNKNOWN", sfo[4096];
@@ -1084,9 +1127,12 @@ int main(int argc, char **argv) {
     if (isa_table) {
         isa_stubs_size = round_page(isa_stub_area_size(isa_table));
         if (isa_stubs_size) isa_stubs = allocate(isa_stubs_size);
-        IsaReport report = isa_rewrite_apply(isa_table, image, isa_stubs, isa_missing_sets);
+        IsaReport report = isa_rewrite_apply(isa_table, image, isa_stubs, isa_missing_sets, isa_diagnostic);
         if (report.unsupported_needed)
-            fail("the linked image contains MOVBE/BMI1/LZCNT encodings that this compatibility layer cannot rewrite");
+            fail("the linked image contains MOVBE/BMI1/LZCNT/AVX2 encodings that this compatibility layer cannot rewrite");
+        if (report.diagnostic_avx2)
+            printf("ISA diagnostic: %u unsupported AVX2 candidates left untouched for runtime validation\n",
+                   report.diagnostic_avx2);
         if (isa_stubs && isa_stubs_size) protect(isa_stubs, isa_stubs_size, 5);
         printf("ISA: rewrote %u sites (%u jmp, %u relocated, %u int3); %u changed sites skipped\n",
                report.rewritten, report.jmp, report.relocated, report.int3, report.skipped);

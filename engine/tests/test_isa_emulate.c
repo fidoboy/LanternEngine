@@ -7,7 +7,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include "isa_emulate.h"
+#include "isa_rewrite.h"
 #include <cpuid.h>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 static int host_has_required_isa(void) {
     unsigned a = 0, b = 0, c = 0, d = 0, leaf1 = 0, leaf7 = 0, ext1 = 0;
@@ -66,8 +73,11 @@ static uint64_t native_register(uint8_t kind, int width, uint64_t src1, uint64_t
 }
 
 static const char *kind_name(uint8_t kind) {
-    static const char *const names[] = {"?", "MOVBE_LOAD", "MOVBE_STORE", "LZCNT", "TZCNT", "ANDN", "BEXTR",
-                                        "BLSI", "BLSMSK", "BLSR"};
+    static const char *const names[] = {
+        "?", "MOVBE_LOAD", "MOVBE_STORE", "LZCNT", "TZCNT", "ANDN", "BEXTR", "BLSI", "BLSMSK", "BLSR",
+        "VPMOVSXBW", "VPMOVSXBD", "VPMOVSXBQ", "VPMOVSXWD", "VPMOVSXWQ", "VPMOVSXDQ",
+        "VPMOVZXBW", "VPMOVZXBD", "VPMOVZXBQ", "VPMOVZXWD", "VPMOVZXWQ", "VPMOVZXDQ"
+    };
     return kind < sizeof names / sizeof names[0] ? names[kind] : "?";
 }
 
@@ -280,9 +290,278 @@ static void check_memory_sources(void) {
     }
 }
 
+
+
+static int host_has_avx_state(void) {
+    unsigned a = 0, b = 0, c = 0, d = 0;
+    if (!__get_cpuid(1, &a, &b, &c, &d)) return 0;
+    if (!(c & (1u << 27)) || !(c & (1u << 28))) return 0; /* OSXSAVE and AVX */
+    unsigned lo, hi;
+    __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
+    return (lo & 6) == 6;
+}
+
+static unsigned char *allocate_test_pages(size_t *page_size, size_t *allocation_size) {
+#ifdef _WIN32
+    SYSTEM_INFO info;
+    GetSystemInfo(&info);
+    *page_size = info.dwPageSize;
+    *allocation_size = *page_size * 2;
+    return (unsigned char *)VirtualAlloc(NULL, *allocation_size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    long page = sysconf(_SC_PAGESIZE);
+    if (page <= 0) return NULL;
+    *page_size = (size_t)page;
+    *allocation_size = *page_size * 2;
+    void *region = mmap(NULL, *allocation_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    return region == MAP_FAILED ? NULL : region;
+#endif
+}
+
+static int protect_test_pages(unsigned char *region, size_t size, int writable) {
+#ifdef _WIN32
+    DWORD previous;
+    return VirtualProtect(region, size, writable ? PAGE_READWRITE : PAGE_EXECUTE_READ, &previous) != 0;
+#else
+    return mprotect(region, size, writable ? PROT_READ | PROT_WRITE : PROT_READ | PROT_EXEC) == 0;
+#endif
+}
+
+static void release_test_pages(unsigned char *region, size_t allocation_size) {
+#ifdef _WIN32
+    (void)allocation_size;
+    VirtualFree(region, 0, MEM_RELEASE);
+#else
+    munmap(region, allocation_size);
+#endif
+}
+
+/* Execute the generated AVX1 save/restore stub around a rewritten AVX2 instruction. */
+static void check_vector_stub_execution(void) {
+    if (!host_has_avx_state()) {
+        puts("isa-emulate-test: vector stub execution skipped (OS AVX state unavailable)");
+        return;
+    }
+    size_t page_size = 0, allocation_size = 0;
+    unsigned char *region = allocate_test_pages(&page_size, &allocation_size);
+    if (!region) {
+        puts("isa-emulate-test FAILED: cannot allocate memory for vector stub");
+        exit(1);
+    }
+
+    uint8_t source[32], source_after[32], destination_seed[32], result[32];
+    for (unsigned i = 0; i < 32; ++i) {
+        source[i] = (uint8_t)(0x80 + i * 7);
+        destination_seed[i] = (uint8_t)(0x5a ^ i);
+    }
+
+    for (unsigned width = 16; width <= 32; width += 16) {
+        if (!protect_test_pages(region, allocation_size, 1)) {
+            puts("isa-emulate-test FAILED: mprotect writable");
+            exit(1);
+        }
+        memset(region, 0x90, allocation_size);
+        const uint8_t instruction[5] = {
+            0xc4, 0x42, (uint8_t)(width == 16 ? 0x79 : 0x7d), 0x20, 0xca
+        }; /* VPMOVSXBW xmm9/ymm9, xmm10 */
+        memcpy(region, instruction, sizeof instruction);
+        region[5] = 0xc3; /* ret */
+
+        IsaSite site = {0};
+        site.length = 5;
+        site.kind = ISA_VPMOVSXBW;
+        site.width = (uint8_t)width;
+        site.mode = ISA_MODE_JMP;
+        site.dst = 9;
+        site.src1 = 10;
+        site.src2 = ISA_NO_REG;
+        site.mem_slot = ISA_MEM_NONE;
+        site.base = site.index = ISA_NO_REG;
+        site.scale = 1;
+        memcpy(site.original, instruction, sizeof instruction);
+
+        uint64_t hit = 0;
+        IsaTable table = {0};
+        table.sites = &site;
+        table.hits = &hit;
+        table.count = 1;
+        IsaReport report = isa_rewrite_apply(&table, region, region + page_size, CPU_SET_AVX2, 0);
+        if (report.rewritten != 1 || report.unsupported_needed != 0) {
+            puts("isa-emulate-test FAILED: AVX2 site was not rewritten");
+            exit(1);
+        }
+        if (!protect_test_pages(region, allocation_size, 0)) {
+            puts("isa-emulate-test FAILED: mprotect executable");
+            exit(1);
+        }
+
+        __asm__ volatile("vmovdqu %0, %%ymm10" : : "m"(*(const uint8_t (*)[32])source) : "memory");
+        __asm__ volatile("vmovdqu %0, %%ymm9" : : "m"(*(const uint8_t (*)[32])destination_seed) : "memory");
+        ((void (*)(void))region)();
+        __asm__ volatile("vmovdqu %%ymm9, %0" : "=m"(*(uint8_t (*)[32])result) : : "memory");
+        __asm__ volatile("vmovdqu %%ymm10, %0" : "=m"(*(uint8_t (*)[32])source_after) : : "memory");
+
+        unsigned elements = width / 2;
+        for (unsigned i = 0; i < elements; ++i) {
+            uint16_t expected = (uint16_t)(int16_t)(int8_t)source[i];
+            if (result[i * 2] != (uint8_t)expected ||
+                result[i * 2 + 1] != (uint8_t)(expected >> 8))
+                fail(ISA_VPMOVSXBW, width, i, source[i], "generated stub result",
+                     (uint8_t)expected, result[i * 2]);
+        }
+        if (width == 16) {
+            for (unsigned i = 16; i < 32; ++i)
+                if (result[i] != 0)
+                    fail(ISA_VPMOVSXBW, width, i, 0, "generated stub upper YMM", 0, result[i]);
+        }
+        if (memcmp(source, source_after, sizeof source) != 0)
+            fail(ISA_VPMOVSXBW, width, 0, 0, "generated stub source YMM preservation", source[0], source_after[0]);
+    }
+    release_test_pages(region, allocation_size);
+}
+
+static void vector_shape(uint8_t kind, unsigned *source_bytes, unsigned *destination_bytes, int *is_signed) {
+    static const uint8_t source_sizes[6] = {1, 1, 1, 2, 2, 4};
+    static const uint8_t destination_sizes[6] = {2, 4, 8, 4, 8, 8};
+    unsigned index;
+    if (kind >= ISA_VPMOVSXBW && kind <= ISA_VPMOVSXDQ) {
+        index = kind - ISA_VPMOVSXBW;
+        *is_signed = 1;
+    } else {
+        index = kind - ISA_VPMOVZXBW;
+        *is_signed = 0;
+    }
+    *source_bytes = source_sizes[index];
+    *destination_bytes = destination_sizes[index];
+}
+
+static void check_vector_extensions(void) {
+    for (uint8_t kind = ISA_VPMOVSXBW; kind <= ISA_VPMOVZXDQ; ++kind) {
+        unsigned source_size, destination_size;
+        int is_signed;
+        vector_shape(kind, &source_size, &destination_size, &is_signed);
+        for (unsigned width = 16; width <= 32; width += 16) {
+            unsigned elements = width / destination_size;
+            unsigned input_size = elements * source_size;
+            for (int memory = 0; memory <= 1; ++memory) {
+                for (unsigned round = 0; round < 128; ++round) {
+                    uint8_t source[32], memory_buffer[64], expected[32] = {0};
+                    IsaRegs regs = {0};
+                    IsaSite site = {0};
+                    for (unsigned i = 0; i < sizeof source; ++i) source[i] = (uint8_t)xorshift64();
+                    memset(memory_buffer, 0xa5, sizeof memory_buffer);
+                    memcpy(memory_buffer + 5, source, input_size);
+
+                    for (unsigned i = 0; i < 16; ++i) {
+                        regs.gpr[i] = 0x0102030405060708ull * (i + 1);
+                        for (unsigned b = 0; b < 32; ++b)
+                            regs.ymm[i][b] = (uint8_t)(i * 19 + b * 7 + round);
+                    }
+                    regs.rflags = 0x8d5;
+                    if (!memory) memcpy(regs.ymm[1], source, sizeof source);
+                    regs.gpr[2] = (uint64_t)(uintptr_t)memory_buffer;
+
+                    site.kind = kind;
+                    site.width = (uint8_t)width; /* vector width is stored in bytes */
+                    site.dst = 0;
+                    site.src1 = memory ? ISA_NO_REG : 1;
+                    site.src2 = ISA_NO_REG;
+                    site.mem_slot = memory ? ISA_MEM_SRC : ISA_MEM_NONE;
+                    site.base = memory ? 2 : ISA_NO_REG;
+                    site.index = ISA_NO_REG;
+                    site.scale = 1;
+                    site.disp = 5;
+
+                    for (unsigned element = 0; element < elements; ++element) {
+                        uint64_t value = 0;
+                        for (unsigned b = 0; b < source_size; ++b)
+                            value |= (uint64_t)source[element * source_size + b] << (8 * b);
+                        if (is_signed && (value & (1ull << (source_size * 8 - 1)))) {
+                            uint64_t mask = (1ull << (source_size * 8)) - 1;
+                            value |= ~mask;
+                        }
+                        for (unsigned b = 0; b < destination_size; ++b)
+                            expected[element * destination_size + b] = (uint8_t)(value >> (8 * b));
+                    }
+
+                    uint8_t saved_vectors[16][32];
+                    memcpy(saved_vectors, regs.ymm, sizeof saved_vectors);
+                    uint64_t saved_flags = regs.rflags;
+                    uint64_t saved_gprs[16];
+                    memcpy(saved_gprs, regs.gpr, sizeof saved_gprs);
+                    isa_emulate(&site, &regs);
+
+                    for (unsigned b = 0; b < width; ++b) {
+                        if (regs.ymm[0][b] != expected[b])
+                            fail(kind, width, round, memory, "vector result", expected[b], regs.ymm[0][b]);
+                    }
+                    if (width == 16) {
+                        for (unsigned b = 16; b < 32; ++b)
+                            if (regs.ymm[0][b] != 0)
+                                fail(kind, width, round, memory, "upper YMM zeroing", 0, regs.ymm[0][b]);
+                    }
+                    if (regs.rflags != saved_flags)
+                        fail(kind, width, round, memory, "flags", saved_flags, regs.rflags);
+                    for (unsigned i = 0; i < 16; ++i)
+                        if (regs.gpr[i] != saved_gprs[i])
+                            fail(kind, width, round, memory, "GPR preservation", saved_gprs[i], regs.gpr[i]);
+                    for (unsigned i = 1; i < 16; ++i)
+                        if (memcmp(regs.ymm[i], saved_vectors[i], 32) != 0)
+                            fail(kind, width, round, memory, "vector preservation", saved_vectors[i][0], regs.ymm[i][0]);
+                }
+            }
+        }
+    }
+}
+
+static void check_avx2_diagnostic_mode(void) {
+    static const unsigned char instruction[4] = {0xc5, 0xdd, 0xf2, 0x10};
+    unsigned char image[32] = {0};
+    memcpy(image + 8, instruction, sizeof instruction);
+    IsaSite site = {0};
+    site.offset = 8;
+    site.length = sizeof instruction;
+    site.kind = ISA_AVX2_UNSUPPORTED;
+    site.mode = ISA_MODE_UNSUPPORTED;
+    memcpy(site.original, instruction, sizeof instruction);
+    uint64_t hit = 0;
+    IsaTable table = {0};
+    table.sites = &site;
+    table.hits = &hit;
+    table.count = 1;
+    table.image_size = sizeof image;
+
+    IsaReport strict = isa_rewrite_apply(&table, image, NULL, CPU_SET_AVX2, 0);
+    if (strict.unsupported_needed != 1 || strict.diagnostic_avx2 != 0) {
+        puts("isa-emulate-test FAILED: strict mode must reject an unsupported AVX2 site");
+        exit(1);
+    }
+    IsaReport diagnostic = isa_rewrite_apply(&table, image, NULL, CPU_SET_AVX2, 1);
+    if (diagnostic.unsupported_needed != 0 || diagnostic.diagnostic_avx2 != 1) {
+        puts("isa-emulate-test FAILED: diagnostic mode must leave unsupported AVX2 sites untouched");
+        exit(1);
+    }
+    if (memcmp(image + 8, instruction, sizeof instruction) != 0) {
+        puts("isa-emulate-test FAILED: diagnostic mode modified the unsupported instruction");
+        exit(1);
+    }
+
+    char description[512];
+    int length = isa_rewrite_describe_fault(&table, (uintptr_t)(image + 8),
+                                            description, sizeof description);
+    if (length <= 0 || !strstr(description, "guest +0x8") ||
+        !strstr(description, "avx2-unsupported") || !strstr(description, "c5 dd f2 10")) {
+        puts("isa-emulate-test FAILED: runtime #UD report lacks the site and instruction bytes");
+        exit(1);
+    }
+}
+
 int main(void) {
+    check_avx2_diagnostic_mode();
+    check_vector_stub_execution();
+    check_vector_extensions();
     if (!host_has_required_isa()) {
-        puts("isa-emulate-test skipped: CPU lacks BMI1, LZCNT or MOVBE");
+        puts("isa-emulate-test: native scalar differential tests skipped (CPU lacks BMI1, LZCNT or MOVBE)");
         return 0;
     }
     if (isa_defined_flags(ISA_MOVBE_LOAD) != 0 || isa_defined_flags(ISA_LZCNT) != (ISA_CF | ISA_ZF)

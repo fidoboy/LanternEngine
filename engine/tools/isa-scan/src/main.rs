@@ -1,16 +1,18 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Adapted from SpartanPort's iced-x86 scanner:
 // https://github.com/FelipePrado0/SpartanPort/blob/main/launcher-rust/src/runner/isa_rewrite.rs
-// Modified for Lantern Engine on 2026-10-31: read BBPROBE5, emit MOVBE/BMI1/LZCNT only,
-// and skip scanning entirely when the host supports all three sets.
+// Modified for Lantern Engine: read BBPROBE5, rewrite MOVBE/BMI1/LZCNT and selected AVX2
+// integer conversions, and fail closed on other AVX2 instructions when the host lacks AVX2.
+
+#![deny(unused_variables)]
 
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use iced_x86::{Code, Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind, Register};
+use iced_x86::{Code, CpuidFeature, Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind, Register};
 use sha2::{Digest, Sha256};
 
 const MAGIC: &[u8; 8] = b"G3ISA1\0\0";
@@ -30,6 +32,19 @@ enum Kind {
     Blsi,
     Blsmsk,
     Blsr,
+    Vpmovsxbw,
+    Vpmovsxbd,
+    Vpmovsxbq,
+    Vpmovsxwd,
+    Vpmovsxwq,
+    Vpmovsxdq,
+    Vpmovzxbw,
+    Vpmovzxbd,
+    Vpmovzxbq,
+    Vpmovzxwd,
+    Vpmovzxwq,
+    Vpmovzxdq,
+    Avx2Unsupported,
 }
 
 impl Kind {
@@ -44,6 +59,19 @@ impl Kind {
             Self::Blsi => 7,
             Self::Blsmsk => 8,
             Self::Blsr => 9,
+            Self::Vpmovsxbw => 10,
+            Self::Vpmovsxbd => 11,
+            Self::Vpmovsxbq => 12,
+            Self::Vpmovsxwd => 13,
+            Self::Vpmovsxwq => 14,
+            Self::Vpmovsxdq => 15,
+            Self::Vpmovzxbw => 16,
+            Self::Vpmovzxbd => 17,
+            Self::Vpmovzxbq => 18,
+            Self::Vpmovzxwd => 19,
+            Self::Vpmovzxwq => 20,
+            Self::Vpmovzxdq => 21,
+            Self::Avx2Unsupported => 22,
         }
     }
 
@@ -52,7 +80,18 @@ impl Kind {
             Self::MovbeLoad | Self::MovbeStore => "MOVBE",
             Self::Lzcnt => "LZCNT",
             Self::Tzcnt | Self::Andn | Self::Bextr | Self::Blsi | Self::Blsmsk | Self::Blsr => "BMI1",
+            Self::Vpmovsxbw | Self::Vpmovsxbd | Self::Vpmovsxbq | Self::Vpmovsxwd |
+            Self::Vpmovsxwq | Self::Vpmovsxdq | Self::Vpmovzxbw | Self::Vpmovzxbd |
+            Self::Vpmovzxbq | Self::Vpmovzxwd | Self::Vpmovzxwq | Self::Vpmovzxdq |
+            Self::Avx2Unsupported => "AVX2",
         }
+    }
+
+    fn is_vector_conversion(self) -> bool {
+        matches!(self,
+            Self::Vpmovsxbw | Self::Vpmovsxbd | Self::Vpmovsxbq | Self::Vpmovsxwd |
+            Self::Vpmovsxwq | Self::Vpmovsxdq | Self::Vpmovzxbw | Self::Vpmovzxbd |
+            Self::Vpmovzxbq | Self::Vpmovzxwd | Self::Vpmovzxwq | Self::Vpmovzxdq)
     }
 }
 
@@ -109,15 +148,104 @@ fn checked_skip(data: &[u8], at: &mut usize, count: u64, width: u64) -> Result<(
     Ok(())
 }
 
-// Lantern's BBPROBE5 and SpartanPort's G3PROBE5 have the same linked-image
-// field layout. The executable segment table precedes import names and relocs.
-fn read_boot_linked(data: &[u8]) -> Result<(Vec<Segment>, Vec<u8>), String> {
+// Keep provenance for CFG roots. Entry points, module initializers and linked STT_FUNC
+// bindings are strong roots. Image-relative relocations into executable memory are only
+// candidate function pointers: they can also describe addresses of internal code/data labels.
+#[derive(Default)]
+struct RelocationRoot {
+    address: u64,
+    target: u64,
+}
+
+#[derive(Default)]
+struct ScanRoots {
+    entry_and_init: Vec<u64>,
+    function_bindings: Vec<u64>,
+    relocation_candidates: Vec<RelocationRoot>,
+}
+
+#[derive(Clone, Copy)]
+struct ModuleRange {
+    base: u64,
+    size: u64,
+}
+
+struct LinkedImage {
+    segments: Vec<Segment>,
+    modules: Vec<ModuleRange>,
+    image: Vec<u8>,
+    roots: ScanRoots,
+}
+
+fn normalize_roots(roots: &mut Vec<u64>, segments: &[Segment]) {
+    roots.retain(|address| executable_address(*address, segments));
+    roots.sort_unstable();
+    roots.dedup();
+}
+
+fn executable_address(address: u64, segments: &[Segment]) -> bool {
+    segments.iter().any(|s| {
+        s.flags & 1 != 0 && address >= s.address && address - s.address < s.size
+    })
+}
+
+fn segment_flags_at(address: u64, segments: &[Segment]) -> Option<u64> {
+    segments.iter().find(|s| address >= s.address && address - s.address < s.size)
+        .map(|s| s.flags)
+}
+
+fn module_index_at(address: u64, modules: &[ModuleRange]) -> Option<usize> {
+    modules.iter().position(|m| address >= m.base && address - m.base < m.size)
+}
+
+fn describe_instruction(image: &[u8], address: u64) -> String {
+    let Ok(offset) = usize::try_from(address) else {
+        return format!("+0x{address:x}: out-of-range");
+    };
+    let Some(code) = image.get(offset..) else {
+        return format!("+0x{address:x}: out-of-range");
+    };
+    let Ok(mut decoder) = Decoder::try_with_ip(64, code, address, DecoderOptions::NONE) else {
+        return format!("+0x{address:x}: decoder unavailable");
+    };
+    let ins = decoder.decode();
+    if ins.code() == Code::INVALID {
+        return format!("+0x{address:x}: invalid");
+    }
+    let length = decoder.position().min(code.len());
+    let bytes = code[..length].iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let branch = match ins.op0_kind() {
+        OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64 =>
+            format!(" -> +0x{:x}", ins.near_branch_target()),
+        _ => String::new(),
+    };
+    let operands = (0..ins.op_count())
+        .map(|index| match ins.op_kind(index) {
+            OpKind::Register => format!("{:?}", ins.op_register(index)),
+            OpKind::Memory => format!(
+                "[{:?}+{:?}*{}+{:#x}]",
+                ins.memory_base(), ins.memory_index(), ins.memory_index_scale(),
+                ins.memory_displacement64()
+            ),
+            OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64 =>
+                format!("+0x{:x}", ins.near_branch_target()),
+            _ => format!("{:?}", ins.op_kind(index)),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("+0x{address:x}: {:?} {operands}{branch} [{bytes}]", ins.mnemonic())
+}
+
+fn read_boot_linked(data: &[u8]) -> Result<LinkedImage, String> {
     if data.len() < 8 || (&data[..8] != b"BBPROBE5" && &data[..8] != b"G3PROBE5") {
         return Err("not a BBPROBE5 linked image".into());
     }
     let mut at = 8usize;
     let image_size = take_u64(data, &mut at)?;
-    let _entry = take_u64(data, &mut at)?;
+    let entry = take_u64(data, &mut at)?;
     let segment_count = take_u64(data, &mut at)?;
     let reloc_count = take_u64(data, &mut at)?;
     let import_count = take_u64(data, &mut at)?;
@@ -135,13 +263,36 @@ fn read_boot_linked(data: &[u8]) -> Result<(Vec<Segment>, Vec<u8>), String> {
     if module_count == 0 || module_count > 16 {
         return Err("invalid linked module count".into());
     }
-    checked_skip(data, &mut at, module_count, 7 * 8)?;
+
+    let mut roots = ScanRoots { entry_and_init: vec![entry], ..ScanRoots::default() };
+    let mut modules = Vec::with_capacity(module_count as usize);
+    for _ in 0..module_count {
+        let base = take_u64(data, &mut at)?;
+        let size = take_u64(data, &mut at)?;
+        let init = take_u64(data, &mut at)?;
+        let _tls_address = take_u64(data, &mut at)?;
+        let _tls_memsz = take_u64(data, &mut at)?;
+        let _tls_filesz = take_u64(data, &mut at)?;
+        let _tls_module = take_u64(data, &mut at)?;
+        modules.push(ModuleRange { base, size });
+        if init != 0 {
+            roots.entry_and_init.push(init);
+        }
+    }
 
     let binding_count = take_u64(data, &mut at)?;
     if binding_count > import_count {
         return Err("invalid native binding count".into());
     }
-    checked_skip(data, &mut at, binding_count, 3 * 8)?;
+    for _ in 0..binding_count {
+        let _import_index = take_u64(data, &mut at)?;
+        let address = take_u64(data, &mut at)?;
+        let kind = take_u64(data, &mut at)?;
+        // link_modules.py writes kind 1 for STT_FUNC exports and kind 2 for objects.
+        if kind == 1 {
+            roots.function_bindings.push(address);
+        }
+    }
 
     let mut segments = Vec::with_capacity(segment_count as usize);
     for _ in 0..segment_count {
@@ -155,18 +306,36 @@ fn read_boot_linked(data: &[u8]) -> Result<(Vec<Segment>, Vec<u8>), String> {
     }
 
     checked_skip(data, &mut at, import_count, 128)?;
-    checked_skip(data, &mut at, reloc_count, 4 * 8)?;
+
+    for _ in 0..reloc_count {
+        let target = take_u64(data, &mut at)?;
+        let kind = take_u64(data, &mut at)?;
+        let value = take_u64(data, &mut at)?;
+        let _addend = take_u64(data, &mut at)?;
+        // kind 0 is an image-relative relocation. It may be a static function pointer;
+        // kinds 1 and 2 are imports/TLS and do not contain a local image code address.
+        if kind == 0 {
+            roots.relocation_candidates.push(RelocationRoot { address: value, target });
+        }
+    }
 
     let image_len = usize::try_from(image_size).map_err(|_| "linked image too large")?;
     let end = at.checked_add(image_len).ok_or("linked image size overflow")?;
     if end != data.len() {
         return Err("linked image is truncated or has trailing data".into());
     }
-    Ok((segments, data[at..end].to_vec()))
+
+    normalize_roots(&mut roots.entry_and_init, &segments);
+    normalize_roots(&mut roots.function_bindings, &segments);
+    roots.relocation_candidates.retain(|root| executable_address(root.address, &segments));
+    roots.relocation_candidates.sort_by_key(|root| (root.address, root.target));
+    roots.relocation_candidates.dedup_by_key(|root| (root.address, root.target));
+
+    Ok(LinkedImage { segments, modules, image: data[at..end].to_vec(), roots })
 }
 
 fn kind_of(ins: &Instruction) -> Option<Kind> {
-    Some(match ins.mnemonic() {
+    let kind = match ins.mnemonic() {
         Mnemonic::Movbe if ins.op0_kind() == OpKind::Register => Kind::MovbeLoad,
         Mnemonic::Movbe => Kind::MovbeStore,
         Mnemonic::Lzcnt => Kind::Lzcnt,
@@ -176,12 +345,39 @@ fn kind_of(ins: &Instruction) -> Option<Kind> {
         Mnemonic::Blsi => Kind::Blsi,
         Mnemonic::Blsmsk => Kind::Blsmsk,
         Mnemonic::Blsr => Kind::Blsr,
+        Mnemonic::Vpmovsxbw => Kind::Vpmovsxbw,
+        Mnemonic::Vpmovsxbd => Kind::Vpmovsxbd,
+        Mnemonic::Vpmovsxbq => Kind::Vpmovsxbq,
+        Mnemonic::Vpmovsxwd => Kind::Vpmovsxwd,
+        Mnemonic::Vpmovsxwq => Kind::Vpmovsxwq,
+        Mnemonic::Vpmovsxdq => Kind::Vpmovsxdq,
+        Mnemonic::Vpmovzxbw => Kind::Vpmovzxbw,
+        Mnemonic::Vpmovzxbd => Kind::Vpmovzxbd,
+        Mnemonic::Vpmovzxbq => Kind::Vpmovzxbq,
+        Mnemonic::Vpmovzxwd => Kind::Vpmovzxwd,
+        Mnemonic::Vpmovzxwq => Kind::Vpmovzxwq,
+        Mnemonic::Vpmovzxdq => Kind::Vpmovzxdq,
+        _ if ins.cpuid_features().contains(&CpuidFeature::AVX2) => Kind::Avx2Unsupported,
         _ => return None,
-    })
+    };
+    Some(kind)
 }
 
 fn register_number(register: Register) -> u8 {
     if register == Register::None { NO_REG } else { register.number() as u8 }
+}
+
+fn vector_register_number(register: Register) -> u8 {
+    let first = if register.size() == 16 { Register::XMM0.number() } else { Register::YMM0.number() };
+    register.number().saturating_sub(first) as u8
+}
+
+fn site_register_number(kind: Kind, register: Register) -> u8 {
+    if kind.is_vector_conversion() && (register.size() == 16 || register.size() == 32) {
+        vector_register_number(register)
+    } else {
+        register_number(register)
+    }
 }
 
 fn site_of(ins: &Instruction, kind: Kind, bytes: &[u8]) -> Site {
@@ -191,11 +387,15 @@ fn site_of(ins: &Instruction, kind: Kind, bytes: &[u8]) -> Site {
     for operand in 0..ins.op_count() {
         match ins.op_kind(operand) {
             OpKind::Register => {
-                let register = ins.op_register(operand);
-                if let Some(slot) = registers.get_mut(operand as usize) {
-                    *slot = register_number(register);
+                if kind != Kind::Avx2Unsupported {
+                    let register = ins.op_register(operand);
+                    if let Some(slot) = registers.get_mut(operand as usize) {
+                        *slot = site_register_number(kind, register);
+                    }
+                    if width == 0 {
+                        width = if kind.is_vector_conversion() { register.size() } else { register.size() * 8 };
+                    }
                 }
-                if width == 0 { width = register.size() * 8; }
             }
             OpKind::Memory => mem_slot = if operand == 0 { 1 } else { 2 },
             _ => {}
@@ -221,6 +421,10 @@ fn site_of(ins: &Instruction, kind: Kind, bytes: &[u8]) -> Site {
         relocated: Vec::new(),
     };
 
+    if kind == Kind::Avx2Unsupported {
+        site.mode = Mode::Unsupported;
+        return site;
+    }
     let mut unsupported = ins.segment_prefix() != Register::None || ins.has_lock_prefix();
     if mem_slot != 0 {
         unsupported |= [ins.memory_base(), ins.memory_index()]
@@ -302,6 +506,119 @@ fn scan_segment(code: &[u8], address: u64) -> Vec<Site> {
     sites
 }
 
+// One CFG-reached instruction together with the root and predecessor that first reached it.
+// This provenance lets the diagnostic identify which relocation candidate introduced a path.
+struct ReachableSite {
+    site: Site,
+    root: u64,
+    edge_from: Option<u64>,
+    previous_instruction: Option<u64>,
+}
+
+// Recursive-descent control-flow scan used as a second opinion on the linear sweep.
+// This is deliberately diagnostic for now: indirect branches and dynamically constructed
+// function pointers can hide edges, so a site not reached from these roots is NOT yet proven
+// to be data and must not be silently removed from the fail-closed rewrite table.
+fn scan_reachable_traced(
+    segments: &[Segment],
+    image: &[u8],
+    roots: &[u64],
+) -> Vec<ReachableSite> {
+    let mut queue: VecDeque<(u64, u64, Option<u64>)> =
+        roots.iter().map(|&root| (root, root, None)).collect();
+    let mut decoded = HashSet::new();
+    let mut sites: HashMap<u64, ReachableSite> = HashMap::new();
+
+    while let Some((start, root, edge_from)) = queue.pop_front() {
+        let Some(segment) = segments.iter().find(|s| {
+            s.flags & 1 != 0 && start >= s.address && start - s.address < s.size
+        }) else {
+            continue;
+        };
+        let Some(offset) = usize::try_from(start).ok() else { continue; };
+        let Some(segment_end) = usize::try_from(segment.address + segment.size).ok() else { continue; };
+        if segment_end > image.len() || offset >= segment_end {
+            continue;
+        }
+        let code = &image[offset..segment_end];
+        let Ok(mut decoder) = Decoder::try_with_ip(64, code, start, DecoderOptions::NONE) else {
+            continue;
+        };
+        let mut previous_instruction = edge_from;
+
+        while decoder.can_decode() {
+            let byte_start = decoder.position();
+            let ins = decoder.decode();
+            if ins.code() == Code::INVALID {
+                break;
+            }
+            if !decoded.insert(ins.ip()) {
+                break;
+            }
+            let bytes = code.get(byte_start..decoder.position()).unwrap_or_default();
+            if let Some(kind) = kind_of(&ins) {
+                sites.entry(ins.ip()).or_insert_with(|| ReachableSite {
+                    site: site_of(&ins, kind, bytes),
+                    root,
+                    edge_from,
+                    previous_instruction,
+                });
+            }
+
+            let direct_target = (ins.op0_kind() == OpKind::NearBranch64)
+                .then(|| ins.near_branch_target());
+            match ins.flow_control() {
+                FlowControl::Next => {}
+                FlowControl::Call | FlowControl::IndirectCall => {
+                    if let Some(target) = direct_target {
+                        if executable_address(target, segments) {
+                            queue.push_back((target, root, Some(ins.ip())));
+                        }
+                    }
+                    // A call returns to the next instruction. Indirect call targets are
+                    // seeded separately by function bindings and image-relative relocations.
+                }
+                FlowControl::ConditionalBranch => {
+                    if let Some(target) = direct_target {
+                        if executable_address(target, segments) {
+                            queue.push_back((target, root, Some(ins.ip())));
+                        }
+                    }
+                }
+                FlowControl::UnconditionalBranch => {
+                    if let Some(target) = direct_target {
+                        if executable_address(target, segments) {
+                            queue.push_back((target, root, Some(ins.ip())));
+                        }
+                    }
+                    break;
+                }
+                FlowControl::XbeginXabortXend => {
+                    if let Some(target) = direct_target {
+                        if executable_address(target, segments) {
+                            queue.push_back((target, root, Some(ins.ip())));
+                        }
+                    }
+                }
+                FlowControl::IndirectBranch | FlowControl::Return |
+                FlowControl::Interrupt | FlowControl::Exception => break,
+            }
+            previous_instruction = Some(ins.ip());
+        }
+    }
+
+    let mut result: Vec<ReachableSite> = sites.into_values().collect();
+    result.sort_by_key(|entry| entry.site.offset);
+    result
+}
+
+fn scan_reachable(segments: &[Segment], image: &[u8], roots: &[u64]) -> Vec<Site> {
+    scan_reachable_traced(segments, image, roots)
+        .into_iter()
+        .map(|entry| entry.site)
+        .collect()
+}
+
 fn padded(bytes: &[u8]) -> [u8; MAX_INSTRUCTION] {
     let mut out = [0u8; MAX_INSTRUCTION];
     out[..bytes.len()].copy_from_slice(bytes);
@@ -360,6 +677,7 @@ fn missing_cpu_sets() -> Vec<&'static str> {
     if leaf1_ecx & (1 << 22) == 0 { missing.push("MOVBE"); }
     if leaf7_ebx & (1 << 3) == 0 { missing.push("BMI1"); }
     if extended_ecx & (1 << 5) == 0 { missing.push("LZCNT"); }
+    if leaf7_ebx & (1 << 5) == 0 { missing.push("AVX2"); }
     missing
 }
 
@@ -371,21 +689,91 @@ fn missing_cpu_sets() -> Vec<&'static str> {
 fn scan(boot: &Path, out: &Path) -> Result<String, String> {
     let missing = missing_cpu_sets();
     if missing.is_empty() {
-        return Ok("CPU: native MOVBE, BMI1 and LZCNT; scanner skipped, original code will execute natively".into());
+        return Ok("CPU: native MOVBE, BMI1, LZCNT and AVX2; scanner skipped, original code will execute natively".into());
     }
     let data = fs::read(boot).map_err(|e| format!("{}: {e}", boot.display()))?;
-    let (segments, image) = read_boot_linked(&data)?;
+    let linked = read_boot_linked(&data)?;
     let mut sites = Vec::new();
 
-    for segment in segments.iter().filter(|s| s.flags & 1 != 0) {
+    for segment in linked.segments.iter().filter(|s| s.flags & 1 != 0) {
         let start = usize::try_from(segment.address).map_err(|_| "segment offset too large")?;
         let size = usize::try_from(segment.size).map_err(|_| "segment size too large")?;
         let end = start.checked_add(size).ok_or("segment range overflow")?;
-        let code = image.get(start..end).ok_or("executable segment outside linked image")?;
+        let code = linked.image.get(start..end).ok_or("executable segment outside linked image")?;
         sites.extend(scan_segment(code, segment.address));
     }
 
-    let table = encode_table(&image, &sites)?;
+    // Run CFG analysis in two tiers. Entry/init/function-binding roots are stronger evidence;
+    // relocation-derived addresses are retained as a weaker superset because not every
+    // relocation into executable memory denotes a function entry.
+    let mut strong_roots = linked.roots.entry_and_init.clone();
+    strong_roots.extend(linked.roots.function_bindings.iter().copied());
+    normalize_roots(&mut strong_roots, &linked.segments);
+
+    let strong_reachable = scan_reachable(&linked.segments, &linked.image, &strong_roots);
+    let mut all_roots = strong_roots.clone();
+    all_roots.extend(linked.roots.relocation_candidates.iter().map(|root| root.address));
+    normalize_roots(&mut all_roots, &linked.segments);
+    let all_reachable = scan_reachable_traced(&linked.segments, &linked.image, &all_roots);
+
+    let strong_avx2 = strong_reachable.iter().filter(|site| site.kind.set() == "AVX2").count();
+    let strong_unsupported = strong_reachable.iter()
+        .filter(|site| site.kind.set() == "AVX2" && site.mode == Mode::Unsupported).count();
+    let all_avx2 = all_reachable.iter().filter(|entry| entry.site.kind.set() == "AVX2").count();
+    let all_unsupported = all_reachable.iter()
+        .filter(|entry| entry.site.kind.set() == "AVX2" && entry.site.mode == Mode::Unsupported).count();
+    let all_offsets: HashSet<u64> = all_reachable.iter().map(|entry| entry.site.offset).collect();
+    let linear_only_unsupported = sites.iter()
+        .filter(|site| site.kind.set() == "AVX2" && site.mode == Mode::Unsupported &&
+                       !all_offsets.contains(&site.offset)).count();
+    let weak_roots = all_roots.len().saturating_sub(strong_roots.len());
+    let cfg_unsupported: Vec<String> = all_reachable.iter()
+        .filter(|entry| entry.site.kind.set() == "AVX2" &&
+                        entry.site.mode == Mode::Unsupported)
+        .take(16)
+        .map(|entry| {
+            let site = &entry.site;
+            let provenance = if strong_roots.binary_search(&entry.root).is_ok() {
+                "strong"
+            } else {
+                "relocation"
+            };
+            let relocation_context = linked.roots.relocation_candidates.iter()
+                .filter(|root| root.address == entry.root)
+                .take(4)
+                .map(|root| {
+                    let flags = segment_flags_at(root.target, &linked.segments)
+                        .map(|flags| format!("flags=0x{flags:x}"))
+                        .unwrap_or_else(|| "outside-segments".into());
+                    let module = module_index_at(root.target, &linked.modules)
+                        .map(|index| format!("module#{index}"))
+                        .unwrap_or_else(|| "no-module".into());
+                    format!("slot +0x{:x} [{flags}, {module}]", root.target)
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let root_module = module_index_at(entry.root, &linked.modules)
+                .map(|index| format!("module#{index}"))
+                .unwrap_or_else(|| "no-module".into());
+            let edge = entry.edge_from
+                .map(|address| format!("edge from {}", describe_instruction(&linked.image, address)))
+                .unwrap_or_else(|| "entry from relocation root".into());
+            let previous = entry.previous_instruction
+                .map(|address| format!("previous {}", describe_instruction(&linked.image, address)))
+                .unwrap_or_else(|| "no previous instruction".into());
+            format!(
+                "ISA CFG: {provenance} root +0x{:x} [{root_module}] ({relocation_context}); {}; {}; site {}",
+                entry.root, edge, previous, describe_instruction(&linked.image, site.offset)
+            )
+        })
+        .collect();
+    let cfg_detail = if cfg_unsupported.is_empty() {
+        String::new()
+    } else {
+        format!("\n{}", cfg_unsupported.join("\n"))
+    };
+
+    let table = encode_table(&linked.image, &sites)?;
     fs::create_dir_all(out).map_err(|e| format!("{}: {e}", out.display()))?;
     let target = out.join("isa-rewrite.bin");
     let temporary = out.join("isa-rewrite.bin.tmp");
@@ -400,9 +788,13 @@ fn scan(boot: &Path, out: &Path) -> Result<String, String> {
     let int3 = sites.iter().filter(|s| s.mode == Mode::Int3).count();
     let unsupported = sites.iter().filter(|s| s.mode == Mode::Unsupported).count();
     Ok(format!(
-        "CPU missing {}; ISA: {} sites (MOVBE {}, BMI1 {}, LZCNT {}); {} relocated, {} int3, {} unsupported",
+        "CPU missing {}; ISA: {} sites (MOVBE {}, BMI1 {}, LZCNT {}, AVX2 {}); {} relocated, {} int3, {} unsupported\n\
+         ISA CFG: {} strong roots ({} entry/init, {} function bindings): {} AVX2 ({} unsupported); +{} relocation roots: {} AVX2 ({} unsupported); {} unsupported only in linear sweep{}",
         missing.join(", "), sites.len(), count_set("MOVBE"), count_set("BMI1"), count_set("LZCNT"),
-        relocated, int3, unsupported
+        count_set("AVX2"), relocated, int3, unsupported, strong_roots.len(),
+        linked.roots.entry_and_init.len(), linked.roots.function_bindings.len(), strong_avx2,
+        strong_unsupported, weak_roots, all_avx2.saturating_sub(strong_avx2),
+        all_unsupported.saturating_sub(strong_unsupported), linear_only_unsupported, cfg_detail
     ))
 }
 
@@ -454,18 +846,73 @@ mod tests {
     fn reads_lantern_bbprobe5_and_scans_only_the_requested_instruction_sets() {
         let code = bytes("0f38f108c4e270f3c9f30fbdc1c3");
         let boot = lantern_boot_linked(&code);
-        let (segments, image) = read_boot_linked(&boot).unwrap();
-        assert_eq!(segments.len(), 1);
-        assert_eq!(segments[0].address, 0);
-        assert_eq!(segments[0].size, code.len() as u64);
-        assert_eq!(segments[0].flags & 1, 1);
-        assert_eq!(image, code);
+        let linked = read_boot_linked(&boot).unwrap();
+        assert_eq!(linked.segments.len(), 1);
+        assert_eq!(linked.modules.len(), 1);
+        assert_eq!(linked.modules[0].base, 0);
+        assert_eq!(linked.modules[0].size, code.len() as u64);
+        assert_eq!(linked.segments[0].address, 0);
+        assert_eq!(linked.segments[0].size, code.len() as u64);
+        assert_eq!(linked.segments[0].flags & 1, 1);
+        assert_eq!(linked.image, code);
+        assert_eq!(linked.roots.entry_and_init, vec![0]);
+        assert!(linked.roots.function_bindings.is_empty());
+        assert!(linked.roots.relocation_candidates.is_empty());
 
-        let sites = scan_segment(&image, 0);
+        let sites = scan_segment(&linked.image, 0);
         assert_eq!(sites.len(), 3);
         assert_eq!(sites[0].kind, Kind::MovbeStore);
         assert_eq!(sites[1].kind, Kind::Blsr);
         assert_eq!(sites[2].kind, Kind::Lzcnt);
+    }
+
+    #[test]
+    fn keeps_relocation_targets_separate_from_strong_cfg_roots() {
+        // RET at address 0 terminates the entry path. The relocation points at the following
+        // bytes, which decode as VPADDD, but that address is only a weak candidate root.
+        let code = bytes("c3c5f5fec2");
+        let size = code.len() as u64;
+        let words = [
+            size, 0, 1, 1, 0, 1,       // BBPROBE5 header: one relocation
+            0, 0, 0, 0, 0,             // procparam and main TLS
+            1,                           // one module
+            0, size, 0, 0, 0, 0, 0,    // module metadata
+            0,                           // no native bindings
+            0, size, 5,                  // executable segment
+            0, 0, 1, 0,                  // relative relocation: target=0, value=1
+        ];
+        let mut boot = b"BBPROBE5".to_vec();
+        for word in words {
+            boot.extend_from_slice(&word.to_le_bytes());
+        }
+        boot.extend_from_slice(&code);
+
+        let linked = read_boot_linked(&boot).unwrap();
+        assert_eq!(linked.roots.entry_and_init, vec![0]);
+        assert_eq!(linked.roots.relocation_candidates.len(), 1);
+        assert_eq!(linked.roots.relocation_candidates[0].address, 1);
+        assert_eq!(linked.roots.relocation_candidates[0].target, 0);
+
+        let strong = scan_reachable(&linked.segments, &linked.image, &linked.roots.entry_and_init);
+        assert!(strong.is_empty());
+
+        let weak_roots: Vec<u64> = linked.roots.relocation_candidates.iter()
+            .map(|root| root.address)
+            .collect();
+        let expanded = scan_reachable(
+            &linked.segments,
+            &linked.image,
+            &weak_roots
+        );
+        assert_eq!(expanded.len(), 1);
+        assert_eq!(expanded[0].kind, Kind::Avx2Unsupported);
+
+        let traced = scan_reachable_traced(&linked.segments, &linked.image, &weak_roots);
+        assert_eq!(traced.len(), 1);
+        assert_eq!(traced[0].root, 1);
+        assert_eq!(traced[0].edge_from, None);
+        assert_eq!(traced[0].previous_instruction, None);
+        assert_eq!(traced[0].site.kind, Kind::Avx2Unsupported);
     }
 
     #[test]
@@ -477,6 +924,89 @@ mod tests {
         assert_eq!(sites[1].kind, Kind::Blsr);
         assert_eq!(sites[2].kind, Kind::Lzcnt);
         assert!(sites.iter().all(|s| s.mode != Mode::Unsupported));
+    }
+
+
+    #[test]
+    fn scans_all_avx2_sign_and_zero_extension_moves() {
+        let code = bytes(
+            "c4e27920c1c4e27921c1c4e27922c1c4e27923c1c4e27924c1c4e27925c1\
+             c4e27930c1c4e27931c1c4e27932c1c4e27933c1c4e27934c1c4e27935c1"
+                .replace(' ', "").as_str()
+        );
+        let sites = scan_segment(&code, 0x2000);
+        assert_eq!(sites.len(), 12);
+        assert_eq!(sites[0].kind, Kind::Vpmovsxbw);
+        assert_eq!(sites[1].kind, Kind::Vpmovsxbd);
+        assert_eq!(sites[2].kind, Kind::Vpmovsxbq);
+        assert_eq!(sites[3].kind, Kind::Vpmovsxwd);
+        assert_eq!(sites[4].kind, Kind::Vpmovsxwq);
+        assert_eq!(sites[5].kind, Kind::Vpmovsxdq);
+        assert_eq!(sites[6].kind, Kind::Vpmovzxbw);
+        assert_eq!(sites[7].kind, Kind::Vpmovzxbd);
+        assert_eq!(sites[8].kind, Kind::Vpmovzxbq);
+        assert_eq!(sites[9].kind, Kind::Vpmovzxwd);
+        assert_eq!(sites[10].kind, Kind::Vpmovzxwq);
+        assert_eq!(sites[11].kind, Kind::Vpmovzxdq);
+        assert!(sites.iter().all(|site| site.width == 16 && site.dst == 0 && site.src1 == 1));
+        assert!(sites.iter().all(|site| site.mode != Mode::Unsupported));
+
+        // VPMOVSXBW ymm0, xmm1 exercises 256-bit destination and 128-bit source register mapping.
+        let ymm_site = scan_segment(&bytes("c4e27d20c1"), 0x2100).remove(0);
+        assert_eq!(ymm_site.kind, Kind::Vpmovsxbw);
+        assert_eq!(ymm_site.width, 32);
+        assert_eq!(ymm_site.dst, 0);
+        assert_eq!(ymm_site.src1, 1);
+        assert_ne!(ymm_site.mode, Mode::Unsupported);
+
+        // High vector register numbers must be normalized to the 0-15 YMM/XMM index range.
+        let high_site = scan_segment(&bytes("c4427d20ca"), 0x2200).remove(0);
+        assert_eq!(high_site.kind, Kind::Vpmovsxbw);
+        assert_eq!(high_site.width, 32);
+        assert_eq!(high_site.dst, 9);
+        assert_eq!(high_site.src1, 10);
+        assert_ne!(high_site.mode, Mode::Unsupported);
+    }
+
+
+    #[test]
+    fn marks_other_avx2_instructions_unsupported() {
+        // VPADDD ymm0, ymm1, ymm2: an AVX2 instruction not yet emulated.
+        let sites = scan_segment(&bytes("c5f5fec2"), 0x3000);
+        assert_eq!(sites.len(), 1);
+        assert_eq!(sites[0].kind, Kind::Avx2Unsupported);
+        assert_eq!(sites[0].mode, Mode::Unsupported);
+        assert_eq!(sites[0].dst, NO_REG);
+        assert_eq!(sites[0].src1, NO_REG);
+        assert_eq!(sites[0].src2, NO_REG);
+    }
+
+    #[test]
+    fn control_flow_scan_ignores_avx2_bytes_after_return() {
+        // This is data, not an instruction path: RET is the only instruction reachable
+        // from the supplied root, although a linear sweep decodes VPADDD in the following bytes.
+        let code = bytes("c3c5f5fec2");
+        let segment = Segment { address: 0, size: code.len() as u64, flags: 5 };
+        let linear = scan_segment(&code, 0);
+        assert_eq!(linear.len(), 1);
+        assert_eq!(linear[0].kind, Kind::Avx2Unsupported);
+
+        let reachable = scan_reachable(&[segment], &code, &[0]);
+        assert!(reachable.is_empty());
+    }
+
+    #[test]
+    fn control_flow_scan_follows_direct_calls_to_avx2_sites() {
+        // CALL +5 at 0 enters the function at 10; the caller's RET prevents fall-through
+        // into the padding. The AVX2 instruction is reached only through the call edge.
+        let code = bytes("e805000000c390909090c5f5fec2c3");
+        let segment = Segment { address: 0, size: code.len() as u64, flags: 5 };
+        let reachable = scan_reachable(&[segment], &code, &[0]);
+
+        assert_eq!(reachable.len(), 1);
+        assert_eq!(reachable[0].offset, 10);
+        assert_eq!(reachable[0].kind, Kind::Avx2Unsupported);
+        assert_eq!(reachable[0].mode, Mode::Unsupported);
     }
 
     #[test]

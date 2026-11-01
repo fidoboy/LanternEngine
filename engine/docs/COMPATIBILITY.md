@@ -33,17 +33,24 @@ The native game runtime requires **AVX, POPCNT and SSE4.2** (including OS-enable
 These remain hard requirements; `BB_SKIP_CPU_CHECK=1` bypasses the check but does not emulate
 them.
 
-**MOVBE, BMI1 and LZCNT are optional host features.** On hosts that lack any of them, the
-preparation step scans the linked executable and emits a per-image rewrite table. The loader
-replaces only the affected guest instruction sites with compatibility stubs or breakpoint
-fallbacks that emulate the original operation. CPUs that have all three features skip scanning
-and execute the original image unchanged. The compatibility layer deliberately does not cover
-F16C.
+**MOVBE, BMI1, LZCNT and AVX2 are optional host features.** On hosts that lack any of them, the
+preparation step scans executable segments in the linked image and emits a per-image rewrite
+table. The loader replaces affected guest instruction sites with compatibility stubs or breakpoint
+fallbacks.
+
+The AVX2 compatibility path currently emulates the twelve integer widening conversions
+`VPMOVSXBW`, `VPMOVSXBD`, `VPMOVSXBQ`, `VPMOVSXWD`, `VPMOVSXWQ`, `VPMOVSXDQ` and their
+`VPMOVZX*` counterparts. It preserves the guest's YMM state around the scalar helper and uses
+AVX1 `VMOVDQU` to save and restore only the vector registers touched by the instruction.
+Other AVX2 instructions are detected using the decoder's CPUID feature metadata and marked
+unsupported; the loader stops before entering guest code rather than allowing an unhandled
+illegal instruction. F16C remains outside this compatibility path.
 
 This makes Sandy Bridge and Ivy Bridge candidates when their AVX state, POPCNT and SSE4.2 are
-available. The new path is still experimental until tested on those physical CPUs on both
-Windows and Linux; CI's differential tests validate operation results and flags, not game
-stability or frame rate.
+available. The AVX2 path is deliberately partial: it does not claim that every AVX2 instruction
+can be emulated. CI tests the scanner and the twelve conversion semantics; physical validation
+on Sandy Bridge and Ivy Bridge is still required on both Windows and Linux before treating the
+path as stable.
 
 ## What each GPU family lacks
 

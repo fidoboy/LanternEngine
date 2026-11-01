@@ -1,23 +1,24 @@
 /* SPDX-License-Identifier: GPL-2.0-only
  * Adapted from SpartanPort (https://github.com/FelipePrado0/SpartanPort).
- * Modified for Lantern Engine on 2026-10-31: loader interface restricted to MOVBE/BMI1/LZCNT. */
+ * Modified for Lantern Engine: MOVBE/BMI1/LZCNT and selected AVX2 emulation. */
 #ifndef SPARTAN_ISA_REWRITE_H
 #define SPARTAN_ISA_REWRITE_H
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include "isa_emulate.h"
-enum { CPU_SET_MOVBE = 1u << 0, CPU_SET_BMI1 = 1u << 1, CPU_SET_LZCNT = 1u << 2 };
+enum { CPU_SET_MOVBE = 1u << 0, CPU_SET_BMI1 = 1u << 1, CPU_SET_LZCNT = 1u << 2, CPU_SET_AVX2 = 1u << 3 };
 
 typedef struct {
     IsaSite *sites; uint64_t *hits;      /* hits[i] belongs to sites[i] */
     uint32_t count, unsupported;
     uint64_t image_size; uint8_t sha256[32];
     unsigned char *image, *stubs;        /* set by isa_rewrite_apply */
+    uint8_t count_hits;                   /* use atomic hit counters for diagnostic reports */
 } IsaTable;
 /* rewritten = jmp + relocated + int3; skipped and unsupported_needed are outside it. */
-typedef struct { uint32_t rewritten, jmp, relocated, int3, skipped, unsupported_needed; } IsaReport;
-enum { ISA_STUB_BYTES = 256 };
+typedef struct { uint32_t rewritten, jmp, relocated, int3, skipped, unsupported_needed, diagnostic_avx2; } IsaReport;
+enum { ISA_STUB_BYTES = 384 };
 
 /* Parses a G3ISA1 file (spec 4.4). NULL and one stderr line ("ISA: <reason>") when invalid. */
 IsaTable *isa_table_load(const char *path);
@@ -25,11 +26,19 @@ IsaTable *isa_table_load(const char *path);
 int isa_table_matches(const IsaTable *t, const unsigned char *image, uint64_t size);
 size_t isa_stub_area_size(const IsaTable *t);           /* count * ISA_STUB_BYTES */
 unsigned isa_site_set(const IsaSite *s);                 /* CPU_SET_* of the kind */
+/* Enable atomic hit counting for AVX2 conversion sites only; off by default. */
+void isa_rewrite_set_counting(IsaTable *t, int enabled);
 /* Rewrites the sites whose set is in `sets` (spec 5.4). Writes nothing and returns
  * unsupported_needed > 0 when a needed site is UNSUPPORTED. `stubs` has isa_stub_area_size bytes, RW.
+ * diagnostic_avx2 permits only ISA_AVX2_UNSUPPORTED records to remain untouched; this is
+ * for controlled runtime diagnosis on hosts without AVX2, never for normal execution.
  * A JMP_RELOCATE site whose next instruction no longer matches becomes INT3 (its mode in t changes);
  * each skipped or downgraded site gets one stderr line. */
-IsaReport isa_rewrite_apply(IsaTable *t, unsigned char *image, unsigned char *stubs, unsigned sets);
+IsaReport isa_rewrite_apply(IsaTable *t, unsigned char *image, unsigned char *stubs, unsigned sets,
+                            int diagnostic_avx2);
+/* Formats the illegal instruction at `rip` as a guest-relative diagnostic, including the
+ * scanner classification (when present) and the live instruction bytes. Returns text length. */
+int isa_rewrite_describe_fault(const IsaTable *t, uintptr_t rip, char *buffer, size_t capacity);
 
 /* int3 at `address` (the CC byte): 1 when it is a rewritten INT3 site; regs updated, *next_rip = site + its length (4).
  * 0 otherwise, with regs and *next_rip untouched. */
@@ -39,7 +48,9 @@ int isa_rewrite_site_of_stub(const IsaTable *t, uintptr_t rip);
 /* "ISA: most executed sites:" then up to 10 lines "  0x<offset> <mnemonic> <hits>" (hits > 0 only),
  * descending hits, ties by ascending offset. */
 void isa_rewrite_report(const IsaTable *t, FILE *out);
-/* "movbe", "lzcnt", "tzcnt", "andn", "bextr", "blsi", "blsmsk", "blsr"; "?" otherwise. */
+/* Report execution counts for the AVX2 conversion instructions emulated by this compatibility layer. */
+void isa_rewrite_report_avx2(const IsaTable *t, FILE *out);
+/* Instruction mnemonic for the kind, including AVX2 conversions and the unsupported sentinel. */
 const char *isa_kind_name(uint8_t kind);
 
 #endif

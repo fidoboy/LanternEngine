@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only
  * Adapted from SpartanPort (https://github.com/FelipePrado0/SpartanPort).
- * Modified for Lantern Engine on 2026-10-31: MOVBE/BMI1/LZCNT only; F16C excluded. */
+ * Modified for Lantern Engine: MOVBE/BMI1/LZCNT and AVX2 integer extensions. */
 #include "isa_emulate.h"
 
 static unsigned char *isa_image;
@@ -61,6 +61,59 @@ static uint64_t byte_swap(const IsaSite *site, uint64_t value) {
     return __builtin_bswap64(value);
 }
 
+/* The VPMOVSX and VPMOVZX families differ only in source/destination element sizes
+ * and whether the source element is sign-extended. All forms write XMM or YMM,
+ * read only the low source bytes, and zero the upper YMM half for a 128-bit result. */
+static void emulate_vector_extension(const IsaSite *site, IsaRegs *regs) {
+    static const uint8_t source_bytes[6] = {1, 1, 1, 2, 2, 4};
+    static const uint8_t destination_bytes[6] = {2, 4, 8, 4, 8, 8};
+    uint8_t kind = site->kind;
+    int is_signed;
+    unsigned index;
+    if (kind >= ISA_VPMOVSXBW && kind <= ISA_VPMOVSXDQ) {
+        index = kind - ISA_VPMOVSXBW;
+        is_signed = 1;
+    } else if (kind >= ISA_VPMOVZXBW && kind <= ISA_VPMOVZXDQ) {
+        index = kind - ISA_VPMOVZXBW;
+        is_signed = 0;
+    } else {
+        return;
+    }
+    if (site->dst >= 16 || (site->width != 16 && site->width != 32)) return;
+
+    unsigned src_size = source_bytes[index];
+    unsigned dst_size = destination_bytes[index];
+    unsigned elements = site->width / dst_size;
+    unsigned input_size = elements * src_size;
+    unsigned char input[16];
+    unsigned char output[32] = {0};
+    const unsigned char *source;
+
+    if (site->mem_slot == ISA_MEM_SRC) {
+        source = effective_address(site, regs);
+    } else {
+        if (site->src1 >= 16) return;
+        source = regs->ymm[site->src1];
+    }
+    for (unsigned i = 0; i < input_size; ++i) input[i] = source[i];
+
+    for (unsigned element = 0; element < elements; ++element) {
+        uint64_t value = 0;
+        for (unsigned byte = 0; byte < src_size; ++byte)
+            value |= (uint64_t)input[element * src_size + byte] << (byte * 8);
+        if (is_signed && (value & (1ull << (src_size * 8 - 1)))) {
+            uint64_t mask = (1ull << (src_size * 8)) - 1;
+            value |= ~mask;
+        }
+        for (unsigned byte = 0; byte < dst_size; ++byte)
+            output[element * dst_size + byte] = (uint8_t)(value >> (byte * 8));
+    }
+
+    for (unsigned i = 0; i < site->width; ++i) regs->ymm[site->dst][i] = output[i];
+    if (site->width == 16)
+        for (unsigned i = 16; i < 32; ++i) regs->ymm[site->dst][i] = 0;
+}
+
 static uint64_t zf_sf(const IsaSite *site, uint64_t result) {
     return (result == 0 ? ISA_ZF : 0) | (result >> (site->width - 1) & 1 ? ISA_SF : 0);
 }
@@ -75,6 +128,10 @@ uint64_t isa_defined_flags(uint8_t kind) {
 }
 
 void ABI isa_emulate(const IsaSite *site, IsaRegs *regs) {
+    if (site->kind >= ISA_VPMOVSXBW && site->kind <= ISA_VPMOVZXDQ) {
+        emulate_vector_extension(site, regs);
+        return;
+    }
     uint64_t mask = width_mask(site), defined = isa_defined_flags(site->kind);
     uint64_t width = site->width, source, result, flags;
     switch (site->kind) {

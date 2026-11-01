@@ -60,6 +60,7 @@ void runtime_memory_set_gpu_hooks(RuntimeGpuRange map, RuntimeGpuRange unmap, Ru
 void runtime_memory_set_note_write_hook(RuntimeGpuRange note);
 void runtime_memory_set_cpu_write_hook(RuntimeGpuRange hook);
 int runtime_memory_restore_access(void* context, uintptr_t address, int repeated);
+void bb_isa_report_on_exit(void);
 }
 namespace Shader { void RegisterSrtFaultHandler(); }
 
@@ -280,6 +281,10 @@ long EnvMs(const char* name, long fallback) {
 }
 
 [[noreturn]] void TerminateNow(int code) {
+    static std::atomic<bool> report_started{false};
+    if (!report_started.exchange(true, std::memory_order_acq_rel)) {
+        bb_isa_report_on_exit();
+    }
     std::fflush(stdout);
     const char* mode = std::getenv("BB_EXIT_MODE");
     if (mode && std::strcmp(mode, "exit") == 0) {
